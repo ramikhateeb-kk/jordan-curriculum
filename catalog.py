@@ -256,7 +256,7 @@ def _empty(v):
 
 def rows_to_cfg(rows):
     """يحوّل صفوف الجدول [{النوع, العنوان, الصفحة}] إلى وحدات ودروس، ويعيد (cfg, أخطاء)."""
-    errors, cfg, last = [], [], 0
+    errors, cfg, last, prev_kind = [], [], 0, None
     for n, r in enumerate(rows, start=1):
         kind, title, page = r.get("النوع"), r.get("العنوان"), r.get("الصفحة")
         if _empty(kind) and _empty(title) and _empty(page):
@@ -276,9 +276,12 @@ def rows_to_cfg(rows):
         except (TypeError, ValueError):
             errors.append(f"السطر {n}: رقم الصفحة غير صحيح.")
             continue
-        if page <= last:
+        # أغلب الكتب تبدأ الوحدة في الصفحة نفسها التي يبدأ فيها درسها الأول، فيُسمح بذلك (وحدة ثم درس بنفس الصفحة)
+        same_page_ok = page == last and kind == KIND_LESSON and prev_kind == KIND_UNIT
+        if page <= last and not same_page_ok:
             errors.append(f"السطر {n}: رقم الصفحة ({page}) يجب أن يكون أكبر من الذي قبله ({last}).")
         last = max(last, page)
+        prev_kind = kind
         if kind == KIND_UNIT:
             cfg.append({"title": title, "start": page, "lessons": []})
         else:
