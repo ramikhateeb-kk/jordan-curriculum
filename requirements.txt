@@ -1,0 +1,11 @@
+streamlit>=1.52.0
+google-genai
+pymupdf>=1.24.0
+requests
+pandas
+python-docx
+gTTS>=2.5.0
+PyPDF2>=3.0.0
+Pillow>=10.0.0
+python-pptx
+openpyxl
