@@ -263,6 +263,9 @@ def render_quiz(idx, slug, lessons):
 
     st.progress(quiz["i"] / quiz["n"])
     st.markdown(f"**السؤال {quiz['i'] + 1} من {quiz['n']}** — {q.get('_lesson', '')}")
+    if q.get("passage"):
+        with st.container(border=True):
+            st.markdown(q["passage"])
     st.markdown(q["question"])
     if q.get("image_id"):
         _img = images.load(q["image_id"])

@@ -450,8 +450,13 @@ def build_exam_docx(header, selected_by_type, marks, logo_bytes, load_image=None
         _cell(ht.rows[0].cells[0], f"Question {ordinal}: {INSTR_EN[qtype]}", 13, True, L)
         if marks.get(qtype):
             _cell(ht.rows[0].cells[1], f"({marks[qtype]} marks)", 13, True, R)
-        entries = []
+        entries, printed = [], set()
         for n, q in enumerate(items, start=1):
+            if q.get("passage"):      # النص الرئيسي مرة واحدة قبل أول سؤال فرعي عليه
+                pk = q.get("passage_key") or q["passage"][:40]
+                if pk not in printed:
+                    printed.add(pk)
+                    _para(doc.add_paragraph(), q["passage"], 11)
             if qtype == "tf":
                 _para(doc.add_paragraph(), f"{n}. {q['question']}   (      )", 12)
             else:

@@ -547,7 +547,15 @@ def build_docx(header, selected_by_type, marks, logo_bytes):
 
         entries = []
 
+        printed_passages = set()
         for local_n, q in enumerate(items, start=1):
+
+            # النص الرئيسي المشترك يُطبع مرة واحدة قبل أول سؤال فرعي عليه
+            if q.get("passage"):
+                _pk = q.get("passage_key") or q["passage"][:40]
+                if _pk not in printed_passages:
+                    printed_passages.add(_pk)
+                    _right(doc, q["passage"], 11)
 
             # كل سؤال في خلية بعرض الصفحة كاملًا
             # لضمان وصول النص إلى أقصى اليمين.

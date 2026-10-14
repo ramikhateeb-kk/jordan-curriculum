@@ -13,8 +13,10 @@ import difflib
 import html
 import io
 import json
+import math
 import random
 import re
+import uuid
 from datetime import datetime, timezone
 
 import requests
@@ -301,14 +303,19 @@ EXTRACT_SYSTEM = (
     "4) section: عنوان السؤال الرئيسي/القسم كما ورد (مثل «السؤال الأول» أو Section A)، instruction: تعليمات القسم كما وردت، "
     "marks: علامة السؤال رقمًا إن ظهرت وإلا null، number: رقمه المطبوع إن ظهر وإلا null.\n"
     "5) تجاهل الترويسات والمعلومات الإدارية.\n"
-    "6) إذا كان السؤال يعتمد على شكل أو رسم أو صورة أو جدول أو مخطط ظاهر في الصورة المرفقة، فأعد figure_box = "
+    "6) النص الرئيسي المشترك: إذا طلب سؤال رئيسي قراءة نص أو مقال أو مقتطف أو حوار ثم طرح أسئلة فرعية عليه، فضع النص كاملًا "
+    "كما طُبع (مع عنوانه) مرة واحدة في passages بمعرّف مثل P1، وأعطِ كل سؤال فرعي عليه passage_id نفسه. يجب أن يحتوي "
+    "question لكل سؤال فرعي على نص سؤاله وحده (مثل: What does the underlined pronoun refer to?)، أما عبارة السؤال الرئيسي "
+    "العامة (مثل: Read the article and answer the questions) فتوضع في instruction. إن لم يظهر النص في المدخل نفسه "
+    "(مثلًا يقع في صفحة أخرى) فاجعل passage_id = null. لا تكرر النص داخل الأسئلة.\n"
+    "7) إذا كان السؤال يعتمد على شكل أو رسم أو صورة أو جدول أو مخطط ظاهر في الصورة المرفقة، فأعد figure_box = "
     "[ymin, xmin, ymax, xmax] بإحداثيات من 0 إلى 1000 تحيط بالشكل وحده دون نص السؤال أو خياراته، وإلا null. "
     "الشكل المشترك بين عدة أسئلة يُعاد بالإحداثيات نفسها لكل منها. لا تخترع شكلًا غير موجود.\n"
     "أعد JSON فقط بلا أي نص آخر."
 )
 EXTRACT_SCHEMA = (
-    '[{"type":"mcq","question":"...","options":["...","...","...","..."],"correct_index":null,"correct":null,'
-    '"model_answer":null,"section":"...","instruction":"...","marks":null,"number":1,"figure_box":null}]'
+    '{"passages":[{"id":"P1","text":"..."}],"questions":[{"type":"mcq","question":"...","options":["...","...","...","..."],"correct_index":null,"correct":null,'
+    '"model_answer":null,"section":"...","instruction":"...","marks":null,"number":1,"passage_id":null,"figure_box":null}]}'
 )
 
 
@@ -350,14 +357,27 @@ def clean_item(it):
         ma = str(it.get("model_answer") or "").strip()
         d["model_answer"] = ma or None
     n = _num(it.get("number"))
-    return {"number": int(n) if n is not None else None, "qtype": qt, "data": d, "box": it.get("figure_box")}
+    return {"number": int(n) if n is not None else None, "qtype": qt, "data": d, "box": it.get("figure_box"),
+            "pid": it.get("passage_id")}
 
 
 def extract(client, text, image):
     prompt = (f"استخرج كل الأسئلة من المدخل التالي بهذا الشكل بالضبط:\n{EXTRACT_SCHEMA}\n\n"
               f"المدخل:\n{text or '(الأسئلة في الصورة المرفقة)'}")
     data = _ask_json(client, EXTRACT_SYSTEM, [image, prompt] if image is not None else prompt)
-    got = [x for x in (clean_item(i) for i in (data if isinstance(data, list) else [])) if x]
+    passages, qlist = {}, data
+    if isinstance(data, dict):            # {"passages": [...], "questions": [...]}
+        qlist = data.get("questions")
+        for p in data.get("passages") or []:
+            if isinstance(p, dict) and str(p.get("text") or "").strip():
+                passages[str(p.get("id"))] = str(p["text"]).strip()
+    got = [x for x in (clean_item(i) for i in (qlist if isinstance(qlist, list) else [])) if x]
+    keys = {pid: f"p{uuid.uuid4().hex[:8]}" for pid in passages}     # مفتاح فريد لكل نص يربط أسئلته الفرعية
+    for it in got:
+        pid = it.pop("pid", None)
+        if pid is not None and str(pid) in passages:
+            it["data"]["passage"] = passages[str(pid)]
+            it["data"]["passage_key"] = keys[str(pid)]
     if image is not None:                      # اقتطاع الأشكال من الصورة الأصلية وحفظها
         cache = {}
         for it in got:
@@ -501,6 +521,9 @@ def _render_q(r, exams, lang):
     st.markdown(f"<small style='color:gray'>{html.escape(head)}</small>", unsafe_allow_html=True)
     if d.get("instruction"):
         st.markdown(_box(d["instruction"], lang), unsafe_allow_html=True)
+    if d.get("passage"):
+        with st.expander("📄 النص الرئيسي للسؤال"):
+            st.markdown(_box(d["passage"], lang), unsafe_allow_html=True)
     st.markdown(_box(d["question"], lang, bold=True), unsafe_allow_html=True)
     if d.get("image_id"):
         img = images.load(d["image_id"])
@@ -606,12 +629,33 @@ def _review_section(book, flat_lessons, user, lang):
                     delete_exam(e["id"])
                     _clear_caches()
                     st.rerun()
-    drafts = list_questions(slug, status="draft")
-    if not drafts:
+    all_drafts = list_questions(slug, status="draft")
+    if not all_drafts:
         st.info("لا توجد مسوّدات بانتظار المراجعة.")
         return
-    st.markdown(f"**{len(drafts)} سؤال بانتظار المراجعة** (يُعرض {min(REVIEW_BATCH, len(drafts))} في كل مرة)")
-    if st.checkbox("أؤكد أنني راجعت المسوّدات وأريد اعتماد كلها دفعة واحدة", key=f"mall_{slug}"):
+    ex_by_id = {e["id"]: e for e in exams}
+    ex_ids = sorted({q["exam_id"] for q in all_drafts}, reverse=True)
+    ex_label = {i: f"{ex_by_id.get(i, {}).get('year') or '—'} {ex_by_id.get(i, {}).get('session') or ''} (#{i})".strip()
+                for i in ex_ids}
+    f1, f2 = st.columns(2)
+    sel_ex = f1.selectbox("الامتحان", ["كل الامتحانات"] + ex_ids, key=f"mrex_{slug}",
+                          format_func=lambda i: i if i == "كل الامتحانات" else ex_label[i])
+    size = f2.selectbox("عدد الأسئلة في الصفحة", [5, 8, 15, 30], index=1, key=f"mrsz_{slug}")
+    drafts = [q for q in all_drafts if sel_ex == "كل الامتحانات" or q["exam_id"] == sel_ex]
+    n_pages = max(1, math.ceil(len(drafts) / size))
+    pkey = f"mrp_{slug}"
+    page = min(max(st.session_state.get(pkey, 1), 1), n_pages)
+    st.session_state[pkey] = page
+    nv1, nv2, nv3 = st.columns([1, 2, 1])
+    if nv1.button("◀ السابقة", disabled=page <= 1, key=f"mrprev_{slug}"):
+        st.session_state[pkey] = page - 1
+        st.rerun()
+    nv2.markdown(f"<div style='text-align:center'><b>{len(drafts)}</b> سؤال بانتظار المراجعة — صفحة <b>{page}</b> من "
+                 f"<b>{n_pages}</b></div>", unsafe_allow_html=True)
+    if nv3.button("التالية ▶", disabled=page >= n_pages, key=f"mrnext_{slug}"):
+        st.session_state[pkey] = page + 1
+        st.rerun()
+    if st.checkbox("أؤكد أنني راجعت المسوّدات وأريد اعتماد كل المعروضة بالفلتر الحالي دفعة واحدة", key=f"mall_{slug}"):
         if st.button(f"✅ اعتماد كل المسوّدات ({len(drafts)})", key=f"mallb_{slug}"):
             for q in drafts:
                 update_question(q["id"], {"status": "approved", "reviewed_by": user["id"], "reviewed_at": _now()})
@@ -619,10 +663,30 @@ def _review_section(book, flat_lessons, user, lang):
             st.rerun()
     lesson_titles = ["— بلا درس —"] + [l["title"] for l in flat_lessons]
     letters = "ABCDE" if lang == "en" else "أبجدهـ"
-    for q in drafts[:REVIEW_BATCH]:
+    exam_qs = {}      # أسئلة كل امتحان (لكل حالاتها) لمزامنة النص الرئيسي بين الأسئلة الفرعية
+    for q in drafts[(page - 1) * size: page * size]:
         d, k = dict(q["data"]), f"mr_{q['id']}"
+        if q["exam_id"] not in exam_qs:
+            exam_qs[q["exam_id"]] = list_questions(slug, exam_id=q["exam_id"])
+        siblings_all = exam_qs[q["exam_id"]]
+        others = {}
+        for r in siblings_all:
+            pk = r["data"].get("passage_key")
+            if pk and pk != d.get("passage_key") and r["data"].get("passage"):
+                others.setdefault(pk, r["data"]["passage"])
         with st.container(border=True):
             st.caption(f"{QTYPE_AR.get(q['qtype'], '')} — {d.get('section') or ''}")
+            orig_passage = d.get("passage") or ""
+            d_pass = st.text_area("النص الرئيسي المرتبط بالسؤال (اتركه فارغًا إن لم يوجد نص)", orig_passage, height=140,
+                                  key=f"{k}_p", help="في أسئلة «اقرأ النص ثم أجب» يوضع النص هنا مرة واحدة ويُحفظ مع كل سؤال "
+                                                     "فرعي عليه. تعديله هنا يُحدّث الأسئلة الفرعية الأخرى المرتبطة به.")
+            link_choice = None
+            if others:
+                opts_l = ["— بلا ربط —"] + [f"{t[:60]}…" for t in others.values()]
+                pick_l = st.selectbox("ربط السؤال بنص رئيسي آخر من هذا الامتحان", range(len(opts_l)),
+                                      format_func=lambda i, o=opts_l: o[i], key=f"{k}_pl")
+                if pick_l > 0:
+                    link_choice = list(others.items())[pick_l - 1]
             d["question"] = st.text_area("نص السؤال", d["question"], key=f"{k}_q")
             if q["qtype"] == "mcq":
                 opts = [o.strip() for o in st.text_area("الخيارات (خيار في كل سطر)", "\n".join(d.get("options") or []),
@@ -653,7 +717,23 @@ def _review_section(book, flat_lessons, user, lang):
             les = c2.selectbox("الدرس", lesson_titles, index=cur_l, key=f"{k}_l")
             b1, b2 = st.columns(2)
 
-            def _patch(d=d, les=les, up_img=up_img, rm_img=rm_img):
+            def _patch(d=d, les=les, up_img=up_img, rm_img=rm_img, d_pass=d_pass, link_choice=link_choice,
+                       orig_passage=orig_passage, q=q, siblings_all=siblings_all):
+                key = d.get("passage_key")
+                if link_choice:                                  # ربط بنص موجود
+                    key, final = link_choice
+                else:
+                    final = d_pass.strip()
+                if final:
+                    key = key or f"p{q['id']}"
+                    d["passage"], d["passage_key"] = final, key
+                    if not link_choice and final != orig_passage.strip():   # مزامنة بقية الأسئلة الفرعية
+                        for r in siblings_all:
+                            if r["id"] != q["id"] and r["data"].get("passage_key") == key:
+                                update_question(r["id"], {"data": {**r["data"], "passage": final}})
+                else:
+                    d.pop("passage", None)
+                    d.pop("passage_key", None)
                 if up_img is not None:
                     try:
                         d["image_id"] = images.save(*images.prepare(Image.open(io.BytesIO(up_img.getvalue()))))
@@ -685,6 +765,9 @@ def to_qbank_item(row, lesson_ranges):
          "ministry_id": row["id"]}
     if d.get("image_id"):
         q["image_id"] = d["image_id"]
+    if d.get("passage"):                       # السؤال الفرعي ينتقل مع نصه الرئيسي ليُفهم وحده
+        q["passage"] = d["passage"]
+        q["passage_key"] = d.get("passage_key") or f"p{row['id']}"
     if qt == "mcq":
         opts = d.get("options") or []
         if len(opts) != 4 or len(set(opts)) != 4:
