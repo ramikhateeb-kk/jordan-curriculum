@@ -354,6 +354,20 @@ def _set_cell_margins(cell, top=0, start=0, bottom=0, end=0):
 # بناء ملف Word
 # ----------------------------------------------------------------
 
+def _strip_marks(sel):
+    """يزيل علامات [[ ]] (الكلمات المسطَّرة) من نصوص الأسئلة في الورقة العربية."""
+    import re
+    f = lambda t: re.sub(r"\[\[(.+?)\]\]", r"\1", t, flags=re.S)   # noqa: E731
+
+    def clean(v):
+        if isinstance(v, str):
+            return f(v)
+        if isinstance(v, list) and all(isinstance(x, str) for x in v):
+            return [f(x) for x in v]
+        return v
+    return {k: [{kk: clean(vv) for kk, vv in q.items()} for q in items] for k, items in sel.items()}
+
+
 def _add_image(doc, q):
     """صورة/رسم السؤال (إن وُجد) تحت نصه."""
     data = images.load(q.get("image_id")) if q.get("image_id") else None
@@ -841,6 +855,6 @@ def render_exam_builder(idx, slug, subject, sem, flat_lessons, ctx=None, user=No
             data = english_docs.build_exam_docx(header, selected_by_type, _marks, logo.getvalue() if logo else None,
                                                 load_image=images.load)
         else:
-            data = build_docx(header, selected_by_type, _marks, logo.getvalue() if logo else None)
+            data = build_docx(header, _strip_marks(selected_by_type), _marks, logo.getvalue() if logo else None)
         st.download_button("⬇️ تنزيل الاختبار", data=data, file_name=f"اختبار_{subject}.docx",
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")

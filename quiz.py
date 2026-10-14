@@ -11,6 +11,9 @@ import re
 import streamlit as st
 from google.genai import types
 
+import html as _html
+import re as _re
+
 import companion
 import images
 import ministry
@@ -34,6 +37,16 @@ SYSTEM = (
     "4) في الاختيار من متعدد اجعل الخيارات الثلاثة الخاطئة معقولة، لكن غير موجودة في النص كإجابة صحيحة.\n"
     "أعد JSON فقط بلا أي نص آخر."
 )
+def _md_u(text):
+    """يعرض النص؛ وما بين [[ ]] يظهر مسطَّرًا (الكلمات المسطَّرة في الأسئلة الوزارية)."""
+    text = str(text)
+    if "[[" not in text:
+        st.markdown(text)
+        return
+    esc = _re.sub(r"\[\[(.+?)\]\]", r"<u>\1</u>", _html.escape(text), flags=_re.S).replace("\n", "<br>")
+    st.markdown(esc, unsafe_allow_html=True)
+
+
 SYSTEM_EN = (
     "You are a teacher of the Jordanian curriculum writing accurate assessment questions in English. Follow strictly:\n"
     "1) Use ONLY the attached book text; do not use outside information or invent details.\n"
@@ -265,8 +278,8 @@ def render_quiz(idx, slug, lessons):
     st.markdown(f"**السؤال {quiz['i'] + 1} من {quiz['n']}** — {q.get('_lesson', '')}")
     if q.get("passage"):
         with st.container(border=True):
-            st.markdown(q["passage"])
-    st.markdown(q["question"])
+            _md_u(q["passage"])
+    _md_u(q["question"])
     if q.get("image_id"):
         _img = images.load(q["image_id"])
         if _img:

@@ -133,15 +133,16 @@ def add_questions(exam_id, book_slug, items):
 def list_questions(book_slug, status=None, exam_id=None):
     if _sb_on():
         p = {"select": "id,exam_id,number,qtype,data,lesson_title,status,qbank_id,transferred_at", "book_slug": f"eq.{book_slug}",
-             "order": "exam_id.desc,number.asc.nullslast,id.asc"}
+             "order": "exam_id.desc,id.asc"}
         if status:
             p["status"] = f"eq.{status}"
         if exam_id:
             p["exam_id"] = f"eq.{exam_id}"
-        return _get("ministry_questions", p)
+        return sorted(_get("ministry_questions", p),
+                      key=lambda q: (-q["exam_id"], (q.get("data") or {}).get("seq") or q.get("number") or 10**6, q["id"]))
     rows = [q for q in _local()["questions"] if q["book_slug"] == book_slug
             and (not status or q["status"] == status) and (not exam_id or q["exam_id"] == exam_id)]
-    return sorted(rows, key=lambda q: (-q["exam_id"], q.get("number") or 10**6, q["id"]))
+    return sorted(rows, key=lambda q: (-q["exam_id"], (q.get("data") or {}).get("seq") or q.get("number") or 10**6, q["id"]))
 
 
 def update_question(qid, patch):
@@ -294,28 +295,33 @@ def _ask_json(client, system, contents, temperature=0):
 
 
 EXTRACT_SYSTEM = (
-    "أنت مساعد يستخرج الأسئلة من امتحان وزاري سابق (نص أو صورة) إلى JSON منظَّم. التزم بصرامة:\n"
-    "1) انسخ نص كل سؤال وخياراته بلغته الأصلية (عربي أو إنجليزي) كما هو حرفيًا، دون ترجمة أو تصحيح أو إعادة صياغة، "
+    "أنت مساعد يستخرج الأسئلة من امتحان وزاري سابق (نص أو صور صفحاته المتتابعة) إلى JSON هرمي. التزم بصرامة:\n"
+    "1) انسخ كل نص بلغته الأصلية (عربي أو إنجليزي) كما هو حرفيًا، دون ترجمة أو تصحيح أو تلخيص أو إعادة صياغة، "
     "ولا تضف سؤالًا أو خيارًا أو إجابة من عندك.\n"
-    "2) type: mcq (له خيارات)، tf (صح/خطأ أو True/False)، fill (فراغ؛ اكتب الفراغ ______)، short (إجابة قصيرة)، "
-    "essay (كتابة مطوّلة أو فقرة أو مقال)، matching (مطابقة بين عمودين)، other (أي شيء آخر؛ ضع نصه كاملًا في question).\n"
-    "3) options بلا حروف الترقيم (أ، ب، A، B). ضع الإجابة الصحيحة فقط إذا كانت معلَّمة صراحةً في المدخل، وإلا null.\n"
-    "4) section: عنوان السؤال الرئيسي/القسم كما ورد (مثل «السؤال الأول» أو Section A)، instruction: تعليمات القسم كما وردت، "
-    "marks: علامة السؤال رقمًا إن ظهرت وإلا null، number: رقمه المطبوع إن ظهر وإلا null.\n"
-    "5) تجاهل الترويسات والمعلومات الإدارية.\n"
-    "6) النص الرئيسي المشترك: إذا طلب سؤال رئيسي قراءة نص أو مقال أو مقتطف أو حوار ثم طرح أسئلة فرعية عليه، فضع النص كاملًا "
-    "كما طُبع (مع عنوانه) مرة واحدة في passages بمعرّف مثل P1، وأعطِ كل سؤال فرعي عليه passage_id نفسه. يجب أن يحتوي "
-    "question لكل سؤال فرعي على نص سؤاله وحده (مثل: What does the underlined pronoun refer to?)، أما عبارة السؤال الرئيسي "
-    "العامة (مثل: Read the article and answer the questions) فتوضع في instruction. إن لم يظهر النص في المدخل نفسه "
-    "(مثلًا يقع في صفحة أخرى) فاجعل passage_id = null. لا تكرر النص داخل الأسئلة.\n"
-    "7) إذا كان السؤال يعتمد على شكل أو رسم أو صورة أو جدول أو مخطط ظاهر في الصورة المرفقة، فأعد figure_box = "
-    "[ymin, xmin, ymax, xmax] بإحداثيات من 0 إلى 1000 تحيط بالشكل وحده دون نص السؤال أو خياراته، وإلا null. "
-    "الشكل المشترك بين عدة أسئلة يُعاد بالإحداثيات نفسها لكل منها. لا تخترع شكلًا غير موجود.\n"
+    "2) البنية: groups = قائمة بالأسئلة الرئيسية بترتيب ظهورها. المجموعة (group) هي سؤال رئيسي أو فرع منه "
+    "(مثل Question One، أو Question Two - A، أو Question Two - B، أو C: Literature Spot، أو Question Three). لكل مجموعة: "
+    "title عنوانها كما ورد، instruction تعليمات السؤال الرئيسي كما وردت (بكل اللغات المكتوبة)، marks علاماتها إن ظهرت، "
+    "passage، وquestions أسئلتها الفرعية.\n"
+    "3) النص الرئيسي passage: إذا طُلب في السؤال الرئيسي قراءة نص أو مقال أو مقتطف أو قصيدة أو حوار ثم طُرحت أسئلة عليه، "
+    "فضع النص كاملًا مرة واحدة في passage مع عنوانه وفقراته وفواصل الأسطر كما طُبع، ولا تكرره في الأسئلة الفرعية. "
+    "كل سؤال فرعي يحتوي في question على نص سؤاله وحده. إن لم يوجد نص مشترك (مثل 28 سؤال اختيار من متعدد "
+    "مستقلة) فاجعل passage = null وضع كل سؤال مستقلًا في questions.\n"
+    "4) type لكل سؤال فرعي: mcq (له خيارات)، tf (صح/خطأ)، fill (فراغ؛ اكتب الفراغ ______)، short (إجابة قصيرة أو أسئلة فهم)، "
+    "essay (كتابة مطوّلة أو موضوع تعبير)، matching (مطابقة)، other (غير ذلك؛ نصه كاملًا في question). "
+    "خيارات الاختيار من متعدد في options بلا حروف الترقيم (A، B، أ، ب).\n"
+    "5) number رقم السؤال الفرعي المطبوع، marks علامته إن ظهرت (مثل (3 points) فتكون 3). ضع الإجابة الصحيحة "
+    "(correct_index أو correct أو model_answer) فقط إذا كانت معلَّمة صراحةً في المدخل، وإلا null.\n"
+    "6) أي كلمة أو عبارة مسطَّرة (underlined) في المدخل، سواء في نص رئيسي أو سؤال أو خيار، أحِطها بـ [[ ]] "
+    "مثل: When he [[gave the final line of the joke]], nobody laughed.\n"
+    "7) تجاهل الترويسات والملحوظات الإدارية وأرقام الصفحات وعبارات مثل SEE PAGE TWO وصفحات الإجابة الفارغة.\n"
+    "8) إذا اعتمد سؤال على شكل أو رسم أو صورة أو جدول أو مخطط، فأعد figure_page = رقم الصفحة (1 للأولى) وfigure_box = "
+    "[ymin, xmin, ymax, xmax] بإحداثيات من 0 إلى 1000 تحيط بالشكل وحده، وإلا null. لا تعتبر النص المطبوع شكلًا.\n"
     "أعد JSON فقط بلا أي نص آخر."
 )
 EXTRACT_SCHEMA = (
-    '{"passages":[{"id":"P1","text":"..."}],"questions":[{"type":"mcq","question":"...","options":["...","...","...","..."],"correct_index":null,"correct":null,'
-    '"model_answer":null,"section":"...","instruction":"...","marks":null,"number":1,"passage_id":null,"figure_box":null}]}'
+    '{"groups":[{"title":"Question One","instruction":"...","marks":null,"passage":null,"questions":['
+    '{"number":1,"type":"mcq","question":"...","options":["...","...","...","..."],"correct_index":null,"correct":null,'
+    '"model_answer":null,"marks":null,"figure_page":null,"figure_box":null}]}]}'
 )
 
 
@@ -361,40 +367,75 @@ def clean_item(it):
             "pid": it.get("passage_id")}
 
 
+def _as_images(image):
+    if image is None:
+        return []
+    return list(image) if isinstance(image, (list, tuple)) else [image]
+
+
 def extract(client, text, image):
-    prompt = (f"استخرج كل الأسئلة من المدخل التالي بهذا الشكل بالضبط:\n{EXTRACT_SCHEMA}\n\n"
-              f"المدخل:\n{text or '(الأسئلة في الصورة المرفقة)'}")
-    data = _ask_json(client, EXTRACT_SYSTEM, [image, prompt] if image is not None else prompt)
-    passages, qlist = {}, data
-    if isinstance(data, dict):            # {"passages": [...], "questions": [...]}
-        qlist = data.get("questions")
-        for p in data.get("passages") or []:
-            if isinstance(p, dict) and str(p.get("text") or "").strip():
-                passages[str(p.get("id"))] = str(p["text"]).strip()
-    got = [x for x in (clean_item(i) for i in (qlist if isinstance(qlist, list) else [])) if x]
-    keys = {pid: f"p{uuid.uuid4().hex[:8]}" for pid in passages}     # مفتاح فريد لكل نص يربط أسئلته الفرعية
-    for it in got:
-        pid = it.pop("pid", None)
-        if pid is not None and str(pid) in passages:
-            it["data"]["passage"] = passages[str(pid)]
-            it["data"]["passage_key"] = keys[str(pid)]
-    if image is not None:                      # اقتطاع الأشكال من الصورة الأصلية وحفظها
-        cache = {}
-        for it in got:
-            box = it.pop("box", None)
-            if not box:
-                continue
-            key = tuple(round(float(v) / 20) for v in box) if isinstance(box, (list, tuple)) and len(box) == 4 else None
-            if key is None:
-                continue
-            if key not in cache:
-                crop = images.crop_box(image, box)
-                cache[key] = images.save(*images.prepare(crop)) if crop is not None else None
-            if cache[key]:
-                it["data"]["image_id"] = cache[key]
+    """يستخرج أسئلة امتحان من نص و/أو صفحة أو عدة صفحات متتابعة (طلب واحد) إلى أسئلة مرتّبة.
+    كل سؤال فرعي يحمل: section (عنوان السؤال الرئيسي)، instruction، passage (النص الرئيسي المشترك) وpassage_key،
+    وseq (ترتيبه في الامتحان). image: صورة PIL أو قائمة صور لصفحات متتابعة."""
+    imgs = _as_images(image)
+    prompt = (f"استخرج أسئلة هذا الامتحان بهذا الشكل بالضبط:\n{EXTRACT_SCHEMA}\n\n")
+    if text:
+        prompt += f"المدخل:\n{text}"
+    elif len(imgs) > 1:
+        prompt += f"المدخل: {len(imgs)} صفحات متتابعة من الامتحان نفسه مرفقة كصور بترتيبها (الصفحة 1 هي الأولى)."
     else:
-        for it in got:
-            it.pop("box", None)
+        prompt += "المدخل: صفحة الامتحان المرفقة كصورة."
+    contents = prompt
+    if imgs:
+        contents = []
+        for i, im in enumerate(imgs, start=1):
+            contents += [f"الصفحة {i}:", im]
+        contents.append(prompt)
+    data = _ask_json(client, EXTRACT_SYSTEM, contents)
+    groups = data.get("groups") if isinstance(data, dict) else None
+    if groups is None and isinstance(data, dict) and isinstance(data.get("questions"), list):
+        groups = [{"questions": data["questions"]}]            # شكل مبسّط
+    if groups is None and isinstance(data, list):
+        groups = [{"questions": data}]                          # قائمة أسئلة فقط (شكل قديم)
+    got, cache = [], {}
+    for g in groups or []:
+        if not isinstance(g, dict):
+            continue
+        passage = str(g.get("passage") or "").strip()
+        pkey = f"p{uuid.uuid4().hex[:8]}" if passage else None
+        title = str(g.get("title") or "").strip() or None
+        instr = str(g.get("instruction") or "").strip() or None
+        gmarks = _num(g.get("marks"))
+        for qd in g.get("questions") or []:
+            it = clean_item(qd)
+            if not it:
+                continue
+            d = it["data"]
+            d["section"] = d.get("section") or title
+            d["instruction"] = d.get("instruction") or instr
+            if gmarks is not None:
+                d["section_marks"] = gmarks
+            if passage:
+                d["passage"], d["passage_key"] = passage, pkey
+            d["seq"] = len(got) + 1
+            d["number"] = it.get("number")
+            # اقتطاع شكل السؤال من الصفحة المقصودة
+            box, pg = it.pop("box", None), _num(qd.get("figure_page")) if isinstance(qd, dict) else None
+            if box and imgs and isinstance(box, (list, tuple)) and len(box) == 4:
+                src = imgs[int(pg) - 1] if pg and 1 <= int(pg) <= len(imgs) else (imgs[0] if len(imgs) == 1 else None)
+                if src is not None:
+                    try:
+                        key = (id(src),) + tuple(round(float(v) / 20) for v in box)
+                    except (TypeError, ValueError):
+                        key = None
+                    if key:
+                        if key not in cache:
+                            crop = images.crop_box(src, box)
+                            cache[key] = images.save(*images.prepare(crop)) if crop is not None else None
+                        if cache[key]:
+                            d["image_id"] = cache[key]
+            it.pop("pid", None)
+            got.append(it)
     return got
 
 
@@ -509,7 +550,7 @@ def _can_manage(user, book):
 
 def _box(text, lang, bold=False):
     d, a = ("ltr", "left") if lang == "en" else ("rtl", "right")
-    body = html.escape(str(text)).replace("\n", "<br>")
+    body = re.sub(r"\[\[(.+?)\]\]", r"<u>\1</u>", html.escape(str(text)), flags=re.S).replace("\n", "<br>")
     return f"<div dir='{d}' style='text-align:{a};{'font-weight:600;' if bold else ''}margin:2px 0'>{body}</div>"
 
 
@@ -577,10 +618,30 @@ def _bank_tab(book, user, can_manage, lang):
         _render_q(r, exams, lang)
 
 
+def _batches(units, max_pages=6):
+    """وحدات (نص, صورة) → دفعات: صفحات الصور المتتابعة تُرسَل معًا (حتى 6 صفحات) ليبقى النص الرئيسي مع أسئلته،
+    وكل جزء نصي يُرسَل وحده."""
+    out, cur = [], []
+    for text, img in units:
+        if img is None:
+            if cur:
+                out.append(("", cur))
+                cur = []
+            out.append((text, None))
+        else:
+            cur.append(img)
+            if len(cur) >= max_pages:
+                out.append(("", cur))
+                cur = []
+    if cur:
+        out.append(("", cur))
+    return out
+
+
 def _upload_section(book, flat_lessons, user):
     slug = book["slug"]
     st.caption("ارفع ملفات امتحانات سابقة (TXT / Word / PDF / صور). تُحوَّل إلى مسوّدات تراجعها قبل الاعتماد. "
-               "كل صورة أو جزء نصي يُحتسب طلبًا واحدًا من الحصة اليومية. الأشكال والرسومات داخل الأسئلة لا تُنقل (النص فقط).")
+               "كل دفعة (حتى 6 صفحات متتابعة، أو جزء نصي) تُحتسب طلبًا واحدًا من الحصة اليومية. تُقتطع الأشكال من الصور تلقائيًا.")
     c1, c2 = st.columns(2)
     year = c1.number_input("سنة الامتحان", 1990, 2100, datetime.now().year - 1, key=f"mu_y_{slug}")
     session = c2.text_input("الدورة", placeholder="مثال: الدورة الشتوية", key=f"mu_s_{slug}")
@@ -596,12 +657,15 @@ def _upload_section(book, flat_lessons, user):
             except Exception as e:  # noqa: BLE001
                 failed.append(str(e))
                 continue
-            for text, image in units:
+            n_before = len(items)
+            for text, image_group in _batches(units):
                 auth_ui.require_quota_or_stop(user)
-                got = extract(client, text, image)
-                if not got:
-                    failed.append(f"«{f.name}»: لم يُستخرج أي سؤال من أحد أجزاء الملف.")
+                got = extract(client, text, image_group)
+                for it in got:                       # ترتيب الأسئلة عبر الأجزاء
+                    it["data"]["seq"] = len(items) + it["data"].get("seq", 1)
                 items += got
+            if len(items) == n_before:
+                failed.append(f"«{f.name}»: لم يُستخرج أي سؤال من هذا الملف.")
         if items:
             tag_lessons(client, items, flat_lessons, user)
             exam_id = add_exam(slug, int(year), session.strip(), ", ".join(f.name for f in files)[:200], user["id"])
@@ -675,18 +739,28 @@ def _review_section(book, flat_lessons, user, lang):
             if pk and pk != d.get("passage_key") and r["data"].get("passage"):
                 others.setdefault(pk, r["data"]["passage"])
         with st.container(border=True):
-            st.caption(f"{QTYPE_AR.get(q['qtype'], '')} — {d.get('section') or ''}")
+            sec = " — ".join(x for x in [d.get("section") or "",
+                                         (f"({d['section_marks']:g} علامة)" if d.get("section_marks") else "")] if x)
+            st.markdown(f"**السؤال الرئيسي:** {html.escape(sec) or '—'}")
+            if d.get("instruction"):
+                st.markdown(_box(d["instruction"], lang), unsafe_allow_html=True)
             orig_passage = d.get("passage") or ""
-            d_pass = st.text_area("النص الرئيسي المرتبط بالسؤال (اتركه فارغًا إن لم يوجد نص)", orig_passage, height=140,
-                                  key=f"{k}_p", help="في أسئلة «اقرأ النص ثم أجب» يوضع النص هنا مرة واحدة ويُحفظ مع كل سؤال "
-                                                     "فرعي عليه. تعديله هنا يُحدّث الأسئلة الفرعية الأخرى المرتبطة به.")
+            if orig_passage:
+                with st.container(border=True):
+                    st.caption("📄 النص الرئيسي (مشترك بين الأسئلة الفرعية)")
+                    st.markdown(_box(orig_passage, lang), unsafe_allow_html=True)
+            st.caption(f"السؤال الفرعي رقم {d.get('number') or q.get('number') or ''} — {QTYPE_AR.get(q['qtype'], '')}")
             link_choice = None
-            if others:
-                opts_l = ["— بلا ربط —"] + [f"{t[:60]}…" for t in others.values()]
-                pick_l = st.selectbox("ربط السؤال بنص رئيسي آخر من هذا الامتحان", range(len(opts_l)),
-                                      format_func=lambda i, o=opts_l: o[i], key=f"{k}_pl")
-                if pick_l > 0:
-                    link_choice = list(others.items())[pick_l - 1]
+            with st.expander("✏️ تعديل النص الرئيسي أو ربطه بنص آخر" if orig_passage else "➕ إضافة نص رئيسي لهذا السؤال"):
+                d_pass = st.text_area("النص الرئيسي (اتركه فارغًا إن لم يوجد نص)", orig_passage, height=140, key=f"{k}_p",
+                                      help="تعديله يُحدّث الأسئلة الفرعية الأخرى المرتبطة بالنص نفسه. "
+                                           "ضع [[ ]] حول الكلمات المسطَّرة.")
+                if others:
+                    opts_l = ["— بلا ربط —"] + [f"{t[:60]}…" for t in others.values()]
+                    pick_l = st.selectbox("ربط السؤال بنص رئيسي آخر من هذا الامتحان", range(len(opts_l)),
+                                          format_func=lambda i, o=opts_l: o[i], key=f"{k}_pl")
+                    if pick_l > 0:
+                        link_choice = list(others.items())[pick_l - 1]
             d["question"] = st.text_area("نص السؤال", d["question"], key=f"{k}_q")
             if q["qtype"] == "mcq":
                 opts = [o.strip() for o in st.text_area("الخيارات (خيار في كل سطر)", "\n".join(d.get("options") or []),

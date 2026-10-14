@@ -5,6 +5,7 @@ english_docs.py
 تحتوي أيضًا تعليمات الذكاء الاصطناعي ومخططات JSON والبيانات الاحتياطية بالإنجليزية.
 """
 import io
+import re
 
 from docx import Document
 from docx.enum.section import WD_ORIENT, WD_SECTION
@@ -84,15 +85,27 @@ def _para(p, text, size=11, bold=False, align=L):
     p.alignment = align
     pf = p.paragraph_format
     pf.space_before = pf.space_after = Pt(0)
-    r = p.add_run(text)
-    r.font.size, r.font.bold, r.font.name = Pt(size), bold, FONT
-    r_pr = r._element.get_or_add_rPr()
-    fonts = r_pr.find(qn("w:rFonts"))
-    if fonts is None:
-        fonts = OxmlElement("w:rFonts")
-        r_pr.append(fonts)
-    for a in ("w:ascii", "w:hAnsi", "w:cs"):
-        fonts.set(qn(a), FONT)
+    text = str(text)
+    parts, pos = [], 0
+    for m in re.finditer(r"\[\[(.+?)\]\]", text, flags=re.S):      # [[x]] = كلمة مسطَّرة في الأسئلة الوزارية
+        if m.start() > pos:
+            parts.append((text[pos:m.start()], False))
+        parts.append((m.group(1), True))
+        pos = m.end()
+    if pos < len(text) or not parts:
+        parts.append((text[pos:], False))
+    r = None
+    for seg, underline in parts:
+        r = p.add_run(seg)
+        r.font.size, r.font.bold, r.font.name = Pt(size), bold, FONT
+        r.font.underline = underline
+        r_pr = r._element.get_or_add_rPr()
+        fonts = r_pr.find(qn("w:rFonts"))
+        if fonts is None:
+            fonts = OxmlElement("w:rFonts")
+            r_pr.append(fonts)
+        for a in ("w:ascii", "w:hAnsi", "w:cs"):
+            fonts.set(qn(a), FONT)
     return r
 
 
