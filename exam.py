@@ -16,6 +16,8 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
 
+import english_docs
+import images
 import qbank
 from quiz import _generate, correct_text
 
@@ -352,6 +354,18 @@ def _set_cell_margins(cell, top=0, start=0, bottom=0, end=0):
 # بناء ملف Word
 # ----------------------------------------------------------------
 
+def _add_image(doc, q):
+    """صورة/رسم السؤال (إن وُجد) تحت نصه."""
+    data = images.load(q.get("image_id")) if q.get("image_id") else None
+    if data:
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        try:
+            p.add_run().add_picture(io.BytesIO(data), width=Cm(8))
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def build_docx(header, selected_by_type, marks, logo_bytes):
     doc = Document()
 
@@ -572,6 +586,8 @@ def build_docx(header, selected_by_type, marks, logo_bytes):
             # ----------------------------------------------------
             # الاختيارات
             # ----------------------------------------------------
+
+            _add_image(doc, q)
 
             if qtype == "mcq":
 
@@ -811,7 +827,12 @@ def render_exam_builder(idx, slug, subject, sem, flat_lessons, ctx=None, user=No
         header = {"liwa": liwa.strip(), "school": school.strip(), "subject": subject, "kind": kind,
                   "semester_label": "الأول" if sem == 1 else "الثاني", "duration": duration,
                   "year": year.strip(), "date": exam_date.strftime("%Y/%m/%d"), "teacher": teacher.strip()}
-        data = build_docx(header, selected_by_type, {k: v for k, v in exam["marks"].items() if exam["counts"][k]},
-                          logo.getvalue() if logo else None)
+        _marks = {k: v for k, v in exam["marks"].items() if exam["counts"][k]}
+        _lang = flat_lessons[0].get("lang", "ar") if flat_lessons else "ar"
+        if _lang == "en":   # مبحث إنجليزي: ورقة الاختبار بالإنجليزية واتجاه الصفحة من اليسار إلى اليمين
+            data = english_docs.build_exam_docx(header, selected_by_type, _marks, logo.getvalue() if logo else None,
+                                                load_image=images.load)
+        else:
+            data = build_docx(header, selected_by_type, _marks, logo.getvalue() if logo else None)
         st.download_button("⬇️ تنزيل الاختبار", data=data, file_name=f"اختبار_{subject}.docx",
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")

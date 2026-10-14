@@ -371,3 +371,114 @@ def build_analysis_docx(meta, units_analysis):
     for i, u in enumerate(units_analysis):
         _analysis_page(doc, i == 0, meta, u)
     return _doc_bytes(doc)
+
+
+# ---------------------------------------------------------------- الاختبار (إنجليزي LTR)
+EXAM_KIND_EN = {"الأول": "First", "الثاني": "Second", "النهائي": "Final"}
+SEM_EN = {"الأول": "First", "الثاني": "Second"}
+ORD_EN = ["One", "Two", "Three", "Four"]
+INSTR_EN = {
+    "mcq": "Choose the correct answer for each of the following:",
+    "tf": "Write (T) if the statement is true and (F) if it is false:",
+    "fill": "Complete the following sentences with suitable words:",
+    "short": "Answer the following questions:",
+}
+LABEL_EN = {"mcq": "Multiple Choice", "tf": "True or False", "fill": "Fill in the Blanks", "short": "Short Answer"}
+
+
+def _correct_en(q):
+    if q["type"] == "mcq":
+        return q["options"][q["correct_index"]]
+    if q["type"] == "tf":
+        return "True" if q["correct"] else "False"
+    return q["model_answer"]
+
+
+def _exam_image(doc, q, load_image):
+    iid = q.get("image_id")
+    data = load_image(iid) if (iid and load_image) else None
+    if data:
+        p = doc.add_paragraph()
+        p.alignment = C
+        try:
+            p.add_run().add_picture(io.BytesIO(data), width=Cm(8))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def build_exam_docx(header, selected_by_type, marks, logo_bytes, load_image=None):
+    """ورقة اختبار إنجليزية: A4 عمودي، اتجاه LTR، تعليمات الأسئلة والإجابات بالإنجليزية.
+    header: liwa, school, kind, subject, year, semester_label, duration, date, teacher (قيم عربية للنوع والفصل تُترجَم هنا)."""
+    doc = Document()
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Cm(21), Cm(29.7)
+    sec.top_margin = sec.bottom_margin = Cm(1.3)
+    sec.left_margin = sec.right_margin = Cm(1.5)
+    _no_bidi(sec)
+
+    if logo_bytes:
+        lp = doc.add_paragraph()
+        lp.alignment = C
+        try:
+            lp.add_run().add_picture(io.BytesIO(logo_bytes), width=Cm(2.6))
+        except Exception:  # noqa: BLE001
+            pass
+    _para(doc.add_paragraph(), f"Directorate of Education - {header['liwa']}" if header.get("liwa")
+          else "Directorate of Education", 13, True, C)
+    _para(doc.add_paragraph(), header.get("school") or "School name", 13, True, C)
+    kind = EXAM_KIND_EN.get(header.get("kind"), header.get("kind") or "")
+    _para(doc.add_paragraph(), f"{kind} Exam - {header['subject']}", 13, True, C)
+    sem = SEM_EN.get(header.get("semester_label"), header.get("semester_label") or "")
+    year = f"Academic year {header['year']}" if header.get("year") else "Academic year ....... / ......."
+    _para(doc.add_paragraph(), f"{sem} Semester     {year}", 12, False, C)
+
+    t = _table(doc, 1, 3, [Cm(6), Cm(6), Cm(6)])
+    n_cell, d_cell, du_cell = t.rows[0].cells
+    _cell(n_cell, "Student's name: " + "_" * 10, 12, False, L)
+    _cell(d_cell, f"Date: {header['date']}", 12, False, C)
+    _cell(du_cell, f"Duration: {header['duration']}", 12, False, R)
+    doc.add_paragraph()
+
+    summary, o = [], 0
+    for qtype in ("mcq", "tf", "fill", "short"):
+        items = selected_by_type.get(qtype) or []
+        if not items:
+            continue
+        ordinal = ORD_EN[o] if o < len(ORD_EN) else str(o + 1)
+        o += 1
+        ht = _table(doc, 1, 2, [Cm(14), Cm(4)])
+        _cell(ht.rows[0].cells[0], f"Question {ordinal}: {INSTR_EN[qtype]}", 13, True, L)
+        if marks.get(qtype):
+            _cell(ht.rows[0].cells[1], f"({marks[qtype]} marks)", 13, True, R)
+        entries = []
+        for n, q in enumerate(items, start=1):
+            if qtype == "tf":
+                _para(doc.add_paragraph(), f"{n}. {q['question']}   (      )", 12)
+            else:
+                _para(doc.add_paragraph(), f"{n}. {q['question']}", 12)
+            _exam_image(doc, q, load_image)
+            if qtype == "mcq":
+                for i, opt in enumerate(q["options"]):
+                    _para(doc.add_paragraph(), f"{'ABCD'[i]}) {opt}", 12)
+            elif qtype == "short":
+                for _ in range(2):
+                    _para(doc.add_paragraph(), "." * 80, 12)
+            entries.append((n, q))
+        summary.append((ordinal, LABEL_EN[qtype], entries))
+        doc.add_paragraph()
+
+    et = _table(doc, 1, 3, [Cm(6), Cm(6), Cm(6)])
+    _cell(et.rows[0].cells[0], "End of questions", 12, True, L)
+    _cell(et.rows[0].cells[1], "Good luck", 12, True, C)
+    teacher = (header.get("teacher") or "").strip()
+    _cell(et.rows[0].cells[2], "Teacher: " + (teacher or "_" * 14), 12, True, R)
+
+    doc.add_page_break()
+    _para(doc.add_paragraph(), "Answer Key (Teacher's reference)", 13, True, L)
+    for ordinal, label, entries in summary:
+        doc.add_paragraph()
+        _para(doc.add_paragraph(), f"Question {ordinal} ({label}):", 12, True)
+        for n, q in entries:
+            page = f" (page {q['page']})" if q.get("page") else ""
+            _para(doc.add_paragraph(), f"{n}. {_correct_en(q)}{page}", 12)
+    return _doc_bytes(doc)

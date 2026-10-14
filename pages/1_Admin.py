@@ -55,6 +55,7 @@ if books:
           "التخصصات": ("مشترك" if catalog.is_common(b) else "، ".join(catalog.track_name(tracks, t) for t in b["track_ids"]))
                        if b["grade"] in catalog.TRACK_GRADES else "—",
           "اللغة": "English" if b["lang"] == "en" else "العربية",
+          "مرافق": "نعم" if b.get("parent_slug") else "",
           "الوحدات": len(b["units"]), "الدروس": sum(len(u["lessons"]) for u in b["units"]),
           "الرابط": "✅" if b["pdf_url"].startswith("http") else "❌"} for b in books],
         hide_index=True, use_container_width=True)
@@ -105,6 +106,19 @@ lang_label = st.radio("لغة الكتاب", ["العربية", "English"], inde
                       horizontal=True, key=f"lang_{ekey}_{lang_default}",
                       help="كتب English تُنتَج لها خطة الدرس والخطة الفصلية وتحليل المحتوى بالإنجليزية واتجاه الصفحة من اليسار إلى اليمين.")
 
+# ---- كتاب مرافق (مثل كتاب الأنشطة): يرتبط بكتاب رئيسي ويُخفى من قوائم المواد
+_parents = {"— كتاب رئيسي (ليس مرافقًا) —": None}
+for _b in books:
+    if not _b.get("parent_slug") and not (editing and _b["slug"] == existing["slug"]):
+        _parents[_book_label(_b)] = _b["slug"]
+_cur_parent = existing.get("parent_slug") if editing else None
+_pl = list(_parents)
+_idx = next((i for i, k in enumerate(_pl) if _parents[k] == _cur_parent), 0)
+parent_label = st.selectbox("هل هذا الكتاب مرافق لكتاب آخر؟", _pl, index=_idx, key=f"par_{ekey}",
+                            help="اختر الكتاب الرئيسي إن كان هذا كتاب أنشطة/تمارين له. يُربط درس كل كتاب بنظيره "
+                                 "تلقائيًا بالوحدة ورقم الدرس (Unit 02 / Lesson 3A مع Lesson 3B).")
+parent_slug = _parents[parent_label]
+
 pdf_url = st.text_input("رابط الكتاب المباشر (PDF)", value=existing["pdf_url"] if editing else "", key=f"u_{ekey}")
 offset = st.number_input(
     "فرق الترقيم = (رقم الصفحة في ملف PDF) − (الرقم المطبوع في الكتاب)",
@@ -113,11 +127,33 @@ st.caption("مثال: إن كانت الصفحة المطبوع عليها ال�
 
 st.markdown("**جدول الوحدات والدروس** — أدخل الصفوف بترتيب قائمة المحتويات: سطر لكل وحدة ثم سطر لكل درس "
             "(و«مراجعة الوحدة» تُدخل كدرس)، وأرقام الصفحات هي المطبوعة في الكتاب.")
-init_rows = catalog.cfg_to_rows(existing["units"]) if editing and existing["units"] else \
-    [{"النوع": "وحدة", "العنوان": "", "الصفحة": None}]
+# ---- رفع ملف الوحدات والدروس (CSV / Excel / JSON) بدل الإدخال اليدوي
+vkey = f"uver_{ekey}"
+rkey = f"urows_{ekey}"
+st.session_state.setdefault(vkey, 0)
+with st.expander("📤 رفع ملف الوحدات والدروس (CSV أو Excel أو JSON)"):
+    st.caption("الأعمدة: النوع (وحدة/درس) — العنوان — الصفحة المطبوعة. يملأ الملف الجدول أدناه ويمكنك تعديله قبل الحفظ.")
+    st.download_button("⬇️ تنزيل قالب CSV", data=catalog.units_template_csv(), file_name="units_template.csv",
+                       mime="text/csv", key=f"tpl_{ekey}")
+    up_units = st.file_uploader("اختر الملف", type=["csv", "tsv", "txt", "xlsx", "json"], key=f"upu_{ekey}_{st.session_state[vkey]}")
+    if up_units is not None:
+        up_rows, up_errs = catalog.parse_units_file(up_units.getvalue(), up_units.name)
+        _, cfg_errs = catalog.rows_to_cfg(up_rows) if up_rows else ([], [])
+        for e in up_errs + cfg_errs:
+            st.error(e)
+        if up_rows and not (up_errs or cfg_errs):
+            st.session_state[rkey] = up_rows
+            st.session_state[vkey] += 1
+            st.rerun()
+        elif up_rows:
+            st.warning("لم يُستبدل الجدول بسبب الأخطاء أعلاه. صحّح الملف وأعد رفعه.")
+
+init_rows = st.session_state.get(rkey) or (
+    catalog.cfg_to_rows(existing["units"]) if editing and existing["units"] else
+    [{"النوع": "وحدة", "العنوان": "", "الصفحة": None}])
 df0 = pd.DataFrame(init_rows, columns=COLS).astype({"الصفحة": "float64"})
 edited = st.data_editor(
-    df0, num_rows="dynamic", hide_index=True, use_container_width=True, key=f"t_{ekey}",
+    df0, num_rows="dynamic", hide_index=True, use_container_width=True, key=f"t_{ekey}_{st.session_state[vkey]}",
     column_config={
         "النوع": st.column_config.SelectboxColumn("النوع", options=["وحدة", "درس"], required=True, width="small"),
         "العنوان": st.column_config.TextColumn("العنوان", width="large"),
@@ -131,7 +167,8 @@ if subject.strip():
     slug = existing["slug"] if editing else catalog.make_slug(grade, sem, subject, sel_track_ids)
     book = {"grade": grade, "semester": sem, "subject": subject.strip(), "slug": slug,
             "pdf_url": pdf_url.strip(), "page_offset": int(offset), "units": cfg,
-            "track_ids": sel_track_ids, "lang": "en" if lang_label == "English" else "ar"}
+            "track_ids": sel_track_ids, "lang": "en" if lang_label == "English" else "ar",
+            "parent_slug": parent_slug}
 
 if b1.button("💾 حفظ", type="primary"):
     if not subject.strip():

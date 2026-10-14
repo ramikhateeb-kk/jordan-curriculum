@@ -70,6 +70,7 @@ def _clean(b):
         "units": b.get("units") or [],
         "track_ids": sorted({int(t) for t in track_ids}),   # فارغة = كتاب مشترك لكل تخصصات الصف
         "lang": b.get("lang") or guess_lang(subject),
+        "parent_slug": b.get("parent_slug") or None,   # كتاب مرافق (أنشطة) لكتاب رئيسي معرّفه هذا
     }
 
 
@@ -81,6 +82,11 @@ def guess_lang(subject):
 
 def is_english(book):
     return (book or {}).get("lang") == "en"
+
+
+def is_companion(book):
+    """كتاب مرافق (مثل كتاب الأنشطة): يُخفى من قوائم المواد ويخدم كتابه الرئيسي."""
+    return bool(book.get("parent_slug"))
 
 
 def is_common(book):
@@ -118,7 +124,7 @@ def save_book(book):
     if backend_name() == "supabase":
         url, h = _sb()
         payload = {k: book[k] for k in ("grade", "semester", "subject", "slug", "pdf_url",
-                                         "page_offset", "units", "lang")}
+                                         "page_offset", "units", "lang", "parent_slug")}
         r = requests.post(f"{url}/rest/v1/books",
                           headers={**h, "Prefer": "resolution=merge-duplicates,return=representation"},
                           timeout=TIMEOUT, params={"on_conflict": "grade,semester,slug"},
@@ -295,6 +301,83 @@ def rows_to_cfg(rows):
     if not cfg and not errors:
         errors.append("الجدول فارغ.")
     return cfg, errors
+
+
+# ---------------------------------------------------------------- رفع ملف الوحدات والدروس
+_KEYS = {"النوع": "kind", "نوع": "kind", "kind": "kind", "type": "kind",
+         "العنوان": "title", "عنوان": "title", "الاسم": "title", "title": "title", "name": "title",
+         "الصفحة": "page", "الصفحة المطبوعة": "page", "صفحة": "page", "page": "page", "start": "page"}
+_KINDS = {"وحدة": KIND_UNIT, "unit": KIND_UNIT, "درس": KIND_LESSON, "lesson": KIND_LESSON}
+
+
+def _norm_rows(raw_rows):
+    """صفوف بأي تسمية معروفة للأعمدة والأنواع → صفوف قياسية [{النوع, العنوان, الصفحة}] + أخطاء."""
+    rows, errors = [], []
+    for n, r in enumerate(raw_rows, start=1):
+        d = {}
+        for k, v in (r or {}).items():
+            key = _KEYS.get(str(k).strip().lower()) or _KEYS.get(str(k).strip())
+            if key:
+                d[key] = v
+        if not d or all(_empty(v) for v in d.values()):
+            continue
+        kind = _KINDS.get(str(d.get("kind") or "").strip().lower()) or _KINDS.get(str(d.get("kind") or "").strip())
+        if not kind:
+            errors.append(f"السطر {n}: النوع «{d.get('kind') or ''}» غير معروف (استخدم وحدة أو درس).")
+            continue
+        rows.append({"النوع": kind, "العنوان": str(d.get("title") or "").strip(), "الصفحة": d.get("page")})
+    return rows, errors
+
+
+def _decode_text(data):
+    for enc in ("utf-8-sig", "cp1256", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def parse_units_file(data, filename):
+    """يقرأ ملف الوحدات والدروس المرفوع (CSV أو TSV أو Excel أو JSON) ويعيد (صفوف قياسية, أخطاء).
+    الصفوف جاهزة لـ rows_to_cfg. صيغ JSON المقبولة: قائمة صفوف، أو cfg الوحدات [{title,start,lessons}]،
+    أو كتاب كامل {"units": [...]}، أو ملف التصدير الذي فيه كتاب واحد."""
+    name = (filename or "").lower()
+    try:
+        if name.endswith(".json"):
+            obj = json.loads(_decode_text(data))
+            if isinstance(obj, list) and len(obj) == 1 and isinstance(obj[0], dict) and "units" in obj[0]:
+                obj = obj[0]
+            if isinstance(obj, dict) and "units" in obj:
+                obj = obj["units"]
+            if isinstance(obj, list) and obj and isinstance(obj[0], dict) and "lessons" in obj[0]:
+                return cfg_to_rows(obj), []
+            if isinstance(obj, list):
+                return _norm_rows(obj)
+            return [], ["صيغة JSON غير مدعومة: المطلوب قائمة صفوف أو وحدات."]
+        if name.endswith((".xlsx", ".xlsm")):
+            import io
+
+            import openpyxl
+            ws = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True).worksheets[0]
+            it = ws.iter_rows(values_only=True)
+            head = [str(h).strip() if h is not None else "" for h in next(it, [])]
+            return _norm_rows([dict(zip(head, row)) for row in it])
+        import csv
+        import io
+        text = _decode_text(data)
+        delim = max([",", "\t", ";"], key=lambda d: text.split("\n", 1)[0].count(d))
+        return _norm_rows(list(csv.DictReader(io.StringIO(text), delimiter=delim)))
+    except Exception as e:  # noqa: BLE001
+        return [], [f"تعذّرت قراءة الملف: {e}"]
+
+
+def units_template_csv():
+    """قالب CSV (UTF-8 مع BOM ليفتح في Excel بالعربية) يوضح الصيغة المطلوبة."""
+    sample = [(KIND_UNIT, "Unit 01: Get the message", 4), (KIND_LESSON, "Lesson 1A Vocabulary and Grammar: Messaging through time", 4),
+              (KIND_LESSON, "Lesson 2A Reading and Vocabulary: Making contact", 6),
+              (KIND_UNIT, "Unit 02: Looking ahead", 14), (KIND_LESSON, "Lesson 1A Vocabulary and Grammar: Future forms", 14)]
+    return ("\ufeffالنوع,العنوان,الصفحة\n" + "\n".join(f'{k},"{t}",{p}' for k, t, p in sample) + "\n").encode("utf-8")
 
 
 def cfg_to_rows(cfg):

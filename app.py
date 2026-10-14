@@ -8,6 +8,7 @@ from google.genai import types
 import accounts as acc
 import auth_ui
 import catalog
+import companion
 import ingest
 import profile_ctx
 from config import GEMINI_MODEL
@@ -17,6 +18,7 @@ from semester_plan import render_semester_plan_builder
 from content_analysis import render_content_analysis_builder
 from attendance import render_attendance_builder
 from marks_book import render_marks_book_builder
+from ministry import render_ministry
 from qbank_manager import render_qbank_builder
 from quiz import render_quiz
 from rag import answer, get_client, load_index, select_context
@@ -155,7 +157,7 @@ elif role != "student" and catalog.tracks_of_grade(tracks, grade):
     st.stop()
 
 pool = acc.books_in_context(user, books, grade, track_id, scope)
-subjects = [b for b in pool if b["semester"] == sem]
+subjects = [b for b in pool if b["semester"] == sem and not catalog.is_companion(b)]
 if not subjects:
     st.info("لم تُضف مواد هذا الصف/التخصص/الفصل بعد، أو لا تملك صلاحية عليها.")
     st.stop()
@@ -195,6 +197,7 @@ flat_lessons = [
      "end": l["end"], "unit_title": u["title"]}
     for u in units for l in u["lessons"]
 ]
+companion.attach(books, book, flat_lessons, lang)   # lang لكل درس + ربط تمارين الكتاب المرافق (إن وُجد)
 if not units:
     st.info("لم تُدخل وحدات ودروس هذا الكتاب بعد من صفحة الإدارة.")
 
@@ -204,11 +207,13 @@ if "action" not in st.session_state or st.session_state.get("action_book") != sl
 
 st.markdown("#### ماذا تريد أن تفعل؟")
 if role == "student":
-    b1, b2 = st.columns(2)
+    b1, b2, b3 = st.columns(3)
     if b1.button("📖\n\nاشرح لي"):
         st.session_state.action = "explain"
     if b2.button("📝\n\nقيّمني"):
         st.session_state.action = "quiz"
+    if b3.button("📜\n\nأسئلة وزارية"):
+        st.session_state.action = "ministry"
 else:
     r1_col1, r1_col2, r1_col3 = st.columns(3)
     if r1_col1.button("🧾\n\nإنشاء اختبار"):
@@ -234,6 +239,10 @@ else:
     if role in ("supervisor", "admin"):   # المعلم العادي لا يملك صلاحية بنك الأسئلة
         if r3_col2.button("🏦\n\nبنك الأسئلة"):
             st.session_state.action = "qbank"
+
+    r4_col1, _r4b, _r4c = st.columns(3)
+    if r4_col1.button("📜\n\nأسئلة وزارية"):
+        st.session_state.action = "ministry"
 
 action = st.session_state.action
 if not action:
@@ -471,6 +480,9 @@ elif action == "qbank":
         st.stop()
     render_qbank_builder(idx, slug, subject, flat_lessons,
                         subject_scope=acc.qbank_subject_scope(user), user=user)
+
+elif action == "ministry":
+    render_ministry(book, flat_lessons, user, lang)
 
 # ---------------------------------------------------------------- الشروط الاحتياطية
 else:

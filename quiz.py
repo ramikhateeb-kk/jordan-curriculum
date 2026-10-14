@@ -11,6 +11,9 @@ import re
 import streamlit as st
 from google.genai import types
 
+import companion
+import images
+import ministry
 import qbank
 from config import GEMINI_MODEL
 from rag import get_client, select_context
@@ -31,12 +34,29 @@ SYSTEM = (
     "4) في الاختيار من متعدد اجعل الخيارات الثلاثة الخاطئة معقولة، لكن غير موجودة في النص كإجابة صحيحة.\n"
     "أعد JSON فقط بلا أي نص آخر."
 )
+SYSTEM_EN = (
+    "You are a teacher of the Jordanian curriculum writing accurate assessment questions in English. Follow strictly:\n"
+    "1) Use ONLY the attached book text; do not use outside information or invent details.\n"
+    "2) The answer must be explicitly supported by the attached text, not inferred or guessed.\n"
+    "3) Write clear English and give the exact page number you took the question from.\n"
+    "4) For multiple choice, make the three wrong options plausible but not correct according to the text.\n"
+    "5) Practice material from the workbook, if provided, is only a guide to question types and language points; "
+    "the page number must be a page of the book text, never of the workbook.\n"
+    "Return JSON only, no other text."
+)
 GRADE_SYSTEM = (
     "أنت مصحّح دقيق. قارن إجابة الطالب بالإجابة النموذجية المعطاة فقط (لا مصدر آخر عندك). "
     "اقبل اختلاف الصياغة والمرادفات ما دام المعنى صحيحًا. أعد JSON فقط بلا أي نص آخر."
 )
 
 CONTEXT_BUDGET = 30000  # حد أقصى لطول نص الدرس المُرسَل عند توليد سؤال جديد (لا يُستخدم عند التصحيح)
+
+SPECS_EN = {
+    "mcq": "a multiple-choice question with four options and exactly one correct answer",
+    "tf": "a statement the student judges as true or false",
+    "fill": "a fill-in-the-blank sentence with exactly one blank written ______ whose answer is a word or short phrase",
+    "short": "a short question answered in one or two sentences",
+}
 
 SPECS = {
     "mcq": ('سؤال اختيار من متعدد بأربعة خيارات وإجابة صحيحة واحدة فقط',
@@ -85,19 +105,36 @@ def _generate(client, idx, slug, lesson, qtype, asked_texts):
     """يولّد سؤالًا جديدًا من نص الدرس، ويحفظه في قاعدة البيانات ليُعاد استخدامه لاحقًا.
     يعيد (السؤال، معرّفه الجديد في قاعدة البيانات أو None إن تعذّر الحفظ)."""
     desc, schema = SPECS[qtype]
+    lang = lesson.get("lang", "ar")
     ctx_pages = select_context(idx, lesson["title"], (lesson["start"], lesson["end"]), max_chars=CONTEXT_BUDGET)
     if not ctx_pages:
         return None, None
-    ctx = "\n\n".join(f"=== صفحة {p['page']} ===\n{p['text']}" for p in ctx_pages)
-    asked = "\n".join(f"- {a}" for a in asked_texts) or "لا يوجد"
-    prompt = (
-        f"الدرس: {lesson['title']}\n\nنص من الكتاب (المصدر الوحيد المسموح به):\n{ctx}\n\n"
-        f"أنشئ {desc}، اعتمادًا على هذا النص فقط.\n"
-        f"لا تكرر هذه الأسئلة الموجودة سلفًا لهذا الدرس:\n{asked}\n\n"
-        f"أعد JSON بهذا الشكل بالضبط:\n{schema}")
+    style = ministry.style_snippet(slug, qtype, lang)              # نمط الأسئلة الوزارية (إن وُجد)
+    practice = companion.exercises_text(lesson)                    # تمارين الكتاب المرافق (إن وُجد نظير للدرس)
+    asked = "\n".join(f"- {a}" for a in asked_texts) or ("none" if lang == "en" else "لا يوجد")
+    if lang == "en":
+        ctx = "\n\n".join(f"=== Page {p['page']} ===\n{p['text']}" for p in ctx_pages)
+        prompt = (
+            f"Lesson: {lesson['title']}\n\nBook text (the only permitted source):\n{ctx}\n\n"
+            + (f"Workbook practice for this lesson (guide to question types only):\n{practice}\n\n" if practice else "")
+            + (f"{style}\n\n" if style else "")
+            + f"Create {SPECS_EN[qtype]}, based on the book text only.\n"
+            f"Do not repeat these existing questions for this lesson:\n{asked}\n\n"
+            f"Return JSON in exactly this format:\n{schema}")
+        system = SYSTEM_EN
+    else:
+        ctx = "\n\n".join(f"=== صفحة {p['page']} ===\n{p['text']}" for p in ctx_pages)
+        prompt = (
+            f"الدرس: {lesson['title']}\n\nنص من الكتاب (المصدر الوحيد المسموح به):\n{ctx}\n\n"
+            + (f"تمارين الكتاب المرافق لهذا الدرس (للاسترشاد بأنواع الأسئلة فقط، ورقم الصفحة من الكتاب الأساسي):\n{practice}\n\n" if practice else "")
+            + (f"{style}\n\n" if style else "")
+            + f"أنشئ {desc}، اعتمادًا على هذا النص فقط.\n"
+            f"لا تكرر هذه الأسئلة الموجودة سلفًا لهذا الدرس:\n{asked}\n\n"
+            f"أعد JSON بهذا الشكل بالضبط:\n{schema}")
+        system = SYSTEM
     for _ in range(2):
-        q = _json(client, SYSTEM, prompt)
-        if _valid(q, qtype, ctx_pages):
+        q = _json(client, system, prompt)
+        if _valid(q, qtype, ctx_pages) and not ministry.too_similar(slug, str(q.get("question", ""))):
             q["type"] = qtype
             if qtype == "mcq":
                 correct = str(q["options"][q["correct_index"]])
@@ -227,6 +264,10 @@ def render_quiz(idx, slug, lessons):
     st.progress(quiz["i"] / quiz["n"])
     st.markdown(f"**السؤال {quiz['i'] + 1} من {quiz['n']}** — {q.get('_lesson', '')}")
     st.markdown(q["question"])
+    if q.get("image_id"):
+        _img = images.load(q["image_id"])
+        if _img:
+            st.image(_img, width=380)
 
     if quiz["res"] is None:
         key = f"ans_{quiz['i']}"
