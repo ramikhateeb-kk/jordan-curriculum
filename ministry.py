@@ -1,8 +1,8 @@
 """
 ملف: ministry.py
 نظام استخراج وحل أسئلة الامتحانات الوزارية - المنهاج الأردني (شهادة الثانوية العامة - التوجيهي)
-الإصلاح الجوهري:
-1. تصدير دالة render_ministry() المطلوبة في app.py
+الإصلاحات الجوهرية:
+1. مطابقة توقيع دالة render_ministry(book, flat_lessons, user, lang, idx, *args, **kwargs) كما يستدعيها app.py في السطر 485
 2. استخراج جميع الأسئلة الرئيسية وكافة الأسئلة الفرعية (أ، ب، ج، د / 1، 2، 3 ...)
 3. حل كل سؤال فرعي من كل سؤال رئيسي إجابة نموذجية وزارية معتمدة 100% مع سلم توزيع العلامات
 """
@@ -18,11 +18,9 @@ def extract_text_from_file(uploaded_file) -> str:
     file_bytes = uploaded_file.read()
     file_name = uploaded_file.name.lower()
 
-    # ملف نصي عادي
     if file_name.endswith(".txt"):
         return file_bytes.decode("utf-8", errors="ignore")
 
-    # ملف PDF
     if file_name.endswith(".pdf"):
         try:
             import pypdf
@@ -44,7 +42,6 @@ def extract_text_from_file(uploaded_file) -> str:
         except Exception:
             pass
 
-    # ملف Word (docx)
     if file_name.endswith(".docx"):
         try:
             import docx
@@ -83,9 +80,7 @@ def get_gemini_client():
 
 
 def extract_and_solve_all_questions(exam_text: str, subject: str = "الرياضيات", branch: str = "العلمي") -> Dict[str, Any]:
-    """
-    استخراج وحل كافة الأسئلة الرئيسية والفرعية بدون أي استثناء
-    """
+    """استخراج وحل كافة الأسئلة الرئيسية والفرعية بدون أي استثناء"""
     client = get_gemini_client()
     if not client:
         return {"error": "لم يتم العثور على مفتاح GEMINI_API_KEY في st.secrets أو متغيرات البيئة"}
@@ -165,30 +160,46 @@ def extract_and_solve_all_questions(exam_text: str, subject: str = "الرياض
         return {"error": f"فشل تحليل استجابة الذكاء الاصطناعي: {e}", "raw": response.text}
 
 
-def render_ministry():
+def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None, *args, **kwargs):
     """
-    الدالة الرئيسية المستدعاة في app.py لعرض واجهة الامتحانات الوزارية
+    الدالة الرئيسية المستدعاة في app.py في السطر 485
+    تدعم الوسائط: render_ministry(book, flat_lessons, user, lang, idx)
     """
     st.header("📋 استخراج وحل الامتحانات الوزارية (المنهاج الأردني)")
     st.caption("نظام معتمد لاستخراج وحل جميع الأسئلة الرئيسية وكافة فروعها 100% مع سلم العلامات الرسمي")
 
-    st.success("✅ **تم تفعيل الحل الشامل**: النظام الآن يستخرج ويحل **كافة الفروع** لكل الأسئلة الرئيسية دون التوقف عند أول فرع.")
+    # استخلاص اسم المبحث والفرع من الكتاب المختار تلقائياً إن وُجد
+    default_subject = "الرياضيات"
+    if book:
+        if isinstance(book, dict):
+            default_subject = book.get("subject", book.get("title", default_subject))
+        else:
+            default_subject = getattr(book, "subject", getattr(book, "title", default_subject))
+
+    st.success("✅ **تم تفعيل الحل الشامل**: النظام يستخرج ويحل **جميع الفروع** لكافة الأسئلة الرئيسية بنسبة 100%.")
 
     col1, col2 = st.columns(2)
     with col1:
+        subjects_list = [
+            "الرياضيات",
+            "اللغة العربية (مشترك)",
+            "الفيزياء",
+            "الكيمياء",
+            "العلوم الحياتية",
+            "التربية الإسلامية",
+            "تاريخ الأردن",
+            "اللغة الإنجليزية",
+        ]
+        s_idx = 0
+        for i, s in enumerate(subjects_list):
+            if s in str(default_subject):
+                s_idx = i
+                break
+
         subject = st.selectbox(
             "المبحث الدراسي:",
-            [
-                "الرياضيات",
-                "اللغة العربية (مشترك)",
-                "الفيزياء",
-                "الكيمياء",
-                "العلوم الحياتية",
-                "التربية الإسلامية",
-                "تاريخ الأردن",
-                "اللغة الإنجليزية",
-            ],
-            index=0,
+            subjects_list,
+            index=s_idx,
         )
 
     with col2:
