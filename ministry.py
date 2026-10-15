@@ -439,6 +439,85 @@ def extract(client, text, image):
     return got
 
 
+ANSWER_SYSTEM = (
+    "أنت معلم خبير تجيب عن أسئلة امتحان وزاري سابق بدقة، وتُراجَع إجاباتك من معلم قبل اعتمادها. التزم بما يلي:\n"
+    "1) للسؤال الذي له passage_key أجب اعتمادًا على النص المرفق له في passages فقط.\n"
+    "2) mcq: أعد correct_index (رقم الخيار الصحيح بدءًا من 0). tf: أعد correct (true أو false). "
+    "fill وshort: أعد answer إجابة مختصرة صحيحة بلغة السؤال (للفراغ: الكلمة أو العبارة الناقصة فقط).\n"
+    "3) الكلمات بين [[ ]] هي الكلمات المسطَّرة في الأصل وعليها مدار السؤال أحيانًا.\n"
+    "4) إن لم تكن متأكدًا فاجعل الإجابة null وconfidence = low. لا تخمّن ولا تخترع.\n"
+    "5) confidence: high أو medium أو low. note: سبب الإجابة في جملة موجزة بلغة السؤال.\n"
+    "أعد JSON فقط."
+)
+ANSWER_TYPES = ("mcq", "tf", "fill", "short")
+
+
+def suggest_answers(client, rows):
+    """يقترح إجابات لأسئلة (rows: [{id, qtype, data}]) بطلب واحد لكل 30 سؤالًا.
+    يعيد {id: بيانات الإجابة المقترحة} لما استطاع فقط. لا يُجيب عن المقالي والمطابقة وغيرها."""
+    out = {}
+    cand = [r for r in rows if r["qtype"] in ANSWER_TYPES]
+    for s in range(0, len(cand), 30):
+        chunk, passages, items = cand[s:s + 30], {}, []
+        for r in chunk:
+            d = r["data"]
+            pk = None
+            if d.get("passage"):
+                pk = d.get("passage_key") or f"p{r['id']}"
+                passages[pk] = d["passage"]
+            items.append({"id": r["id"], "type": r["qtype"], "instruction": d.get("instruction"), "passage_key": pk,
+                          "question": d["question"], "options": d.get("options")})
+        prompt = (f"النصوص المشتركة:\n{json.dumps(passages, ensure_ascii=False)}\n\n"
+                  f"الأسئلة:\n{json.dumps(items, ensure_ascii=False)}\n\n"
+                  'أعد JSON: [{"id":12,"correct_index":null,"correct":null,"answer":null,"confidence":"high","note":"..."}]')
+        data = _ask_json(client, ANSWER_SYSTEM, prompt)
+        by_id = {r["id"]: r for r in chunk}
+        for v in (data if isinstance(data, list) else []):
+            r = by_id.get(v.get("id")) if isinstance(v, dict) else None
+            if not r:
+                continue
+            res = {"ai_answer": True, "ai_conf": v.get("confidence") if v.get("confidence") in ("high", "medium", "low") else "low",
+                   "ai_note": str(v.get("note") or "").strip()[:300] or None}
+            qt = r["qtype"]
+            if qt == "mcq":
+                ci, n = v.get("correct_index"), len(r["data"].get("options") or [])
+                if not (isinstance(ci, int) and not isinstance(ci, bool) and 0 <= ci < n):
+                    continue
+                res["correct_index"] = ci
+            elif qt == "tf":
+                if not isinstance(v.get("correct"), bool):
+                    continue
+                res["correct"] = v["correct"]
+            else:
+                ans = str(v.get("answer") or "").strip()
+                if not ans:
+                    continue
+                res["model_answer"] = ans
+            out[r["id"]] = res
+    return out
+
+
+def _apply_ai(user, rows, replace_existing=False):
+    """يطلب الإجابات ويحفظها في المسوّدات (علامة ai_answer تبقى حتى يعتمدها مراجع) ويعيد عدد ما حُفظ."""
+    todo = []
+    for r in rows:
+        d = r["data"]
+        has = (d.get("correct_index") is not None if r["qtype"] == "mcq" else
+               d.get("correct") is not None if r["qtype"] == "tf" else bool(d.get("model_answer")))
+        if r["qtype"] in ANSWER_TYPES and (replace_existing or not has):
+            todo.append(r)
+    if not todo:
+        return 0, 0
+    auth_ui.require_quota_or_stop(user)
+    res = suggest_answers(get_client(), todo)
+    for r in todo:
+        if r["id"] in res:
+            update_question(r["id"], {"data": {**r["data"], **res[r["id"]]}})
+            for suffix in ("c", "a"):                       # لتتحدّث عناصر الإجابة في الشاشة
+                st.session_state.pop(f"mr_{r['id']}_{suffix}", None)
+    return len(res), len(todo)
+
+
 def tag_lessons(client, items, flat_lessons, user=None):
     """يقترح الدرس المرتبط بكل سؤال (طلب واحد لكل 40 سؤالًا). الفشل لا يوقف شيئًا: يبقى الدرس فارغًا."""
     if not flat_lessons or not items:
@@ -719,16 +798,32 @@ def _review_section(book, flat_lessons, user, lang):
     if nv3.button("التالية ▶", disabled=page >= n_pages, key=f"mrnext_{slug}"):
         st.session_state[pkey] = page + 1
         st.rerun()
+    page_items = drafts[(page - 1) * size: page * size]
+    # ---- اقتراح الإجابات بالذكاء الاصطناعي للأسئلة المعروضة في هذه الصفحة
+    ai_c1, ai_c2 = st.columns([3, 2])
+    replace_all = ai_c2.checkbox("استبدال الإجابات الموجودة", key=f"mairep_{slug}")
+    if ai_c1.button(f"🤖 اقتراح إجابات للأسئلة المعروضة ({len(page_items)})", key=f"maiall_{slug}"):
+        with st.spinner("جارٍ اقتراح الإجابات..."):
+            done_n, tried = _apply_ai(user, page_items, replace_all)
+        st.session_state[f"mainote_{slug}"] = (f"اقتُرحت إجابات لـ {done_n} من {tried} سؤالًا. راجعها قبل الاعتماد."
+                                               if tried else "لا توجد أسئلة تحتاج إجابة في هذه الصفحة.")
+        st.rerun()
+    if st.session_state.get(f"mainote_{slug}"):
+        st.info(st.session_state.pop(f"mainote_{slug}"))
     if st.checkbox("أؤكد أنني راجعت المسوّدات وأريد اعتماد كل المعروضة بالفلتر الحالي دفعة واحدة", key=f"mall_{slug}"):
-        if st.button(f"✅ اعتماد كل المسوّدات ({len(drafts)})", key=f"mallb_{slug}"):
-            for q in drafts:
+        safe = [q for q in drafts if not q["data"].get("ai_answer")]
+        if len(safe) < len(drafts):
+            st.caption(f"⚠️ سيُستثنى {len(drafts) - len(safe)} سؤال إجابته مقترحة من الذكاء الاصطناعي ولم تُراجَع بعد؛ "
+                       "اعتمدها فرديًا بعد مراجعتها.")
+        if st.button(f"✅ اعتماد كل المسوّدات ({len(safe)})", key=f"mallb_{slug}"):
+            for q in safe:
                 update_question(q["id"], {"status": "approved", "reviewed_by": user["id"], "reviewed_at": _now()})
             _clear_caches()
             st.rerun()
     lesson_titles = ["— بلا درس —"] + [l["title"] for l in flat_lessons]
     letters = "ABCDE" if lang == "en" else "أبجدهـ"
     exam_qs = {}      # أسئلة كل امتحان (لكل حالاتها) لمزامنة النص الرئيسي بين الأسئلة الفرعية
-    for q in drafts[(page - 1) * size: page * size]:
+    for q in page_items:
         d, k = dict(q["data"]), f"mr_{q['id']}"
         if q["exam_id"] not in exam_qs:
             exam_qs[q["exam_id"]] = list_questions(slug, exam_id=q["exam_id"])
@@ -778,6 +873,20 @@ def _review_section(book, flat_lessons, user, lang):
             else:
                 d["model_answer"] = st.text_area("الإجابة النموذجية (اختياري)", d.get("model_answer") or "",
                                                  key=f"{k}_a").strip() or None
+            if q["qtype"] in ANSWER_TYPES:
+                if d.get("ai_answer"):
+                    conf = {"high": "عالية", "medium": "متوسطة", "low": "منخفضة"}.get(d.get("ai_conf"), "")
+                    st.warning(f"🤖 الإجابة أعلاه مقترحة من الذكاء الاصطناعي (الثقة: {conf})"
+                               + (f" — {d['ai_note']}" if d.get("ai_note") else "") + ". راجعها وعدّلها إن لزم قبل الاعتماد.")
+                if st.button("🤖 اقتراح الإجابة لهذا السؤال", key=f"{k}_ai"):
+                    now_row = {"id": q["id"], "qtype": q["qtype"],
+                               "data": {**q["data"], "question": d["question"], "options": d.get("options"),
+                                        "passage": (link_choice[1] if link_choice else d_pass.strip()) or None}}
+                    with st.spinner("جارٍ اقتراح الإجابة..."):
+                        got_n, _t = _apply_ai(user, [now_row], replace_existing=True)
+                    st.session_state[f"mainote_{slug}"] = ("اقتُرحت إجابة للسؤال؛ راجعها." if got_n
+                                                           else "لم يستطع الذكاء الاصطناعي تحديد إجابة موثوقة لهذا السؤال.")
+                    st.rerun()
             rm_img, up_img = False, None
             if d.get("image_id"):
                 cur_img = images.load(d["image_id"])
@@ -793,6 +902,8 @@ def _review_section(book, flat_lessons, user, lang):
 
             def _patch(d=d, les=les, up_img=up_img, rm_img=rm_img, d_pass=d_pass, link_choice=link_choice,
                        orig_passage=orig_passage, q=q, siblings_all=siblings_all):
+                for _f in ("ai_answer", "ai_conf", "ai_note"):    # اعتمده مراجع بشري
+                    d.pop(_f, None)
                 key = d.get("passage_key")
                 if link_choice:                                  # ربط بنص موجود
                     key, final = link_choice
