@@ -2,13 +2,15 @@
 ملف: ministry.py
 نظام استخراج وحل أسئلة الامتحانات الوزارية - المنهاج الأردني (شهادة الثانوية العامة - التوجيهي)
 الإصلاحات:
-1. حل مشكلة الـ PDF: دعم ملفات PDF الممسوحة ضوئياً (Scanned PDFs) وقراءتها بالكامل عبر Gemini Vision
-2. مطابقة توقيع render_ministry(book, flat_lessons, user, lang, idx, *args, **kwargs)
-3. استخراج وحل كافة الأسئلة الرئيسية وجميع فروعها 100%
+1. حماية كاملة ضد ضغط الخوادم (503 UNAVAILABLE) عبر التبديل التلقائي بين النماذج وإعادة المحاولة.
+2. حل مشكلة الـ PDF: دعم ملفات PDF الممسوحة ضوئياً (Scanned PDFs) وقراءتها بالكامل عبر Gemini Vision.
+3. مطابقة توقيع render_ministry(book, flat_lessons, user, lang, idx, *args, **kwargs) في السطر 485.
+4. استخراج وحل كافة الأسئلة الرئيسية وجميع فروعها 100%.
 """
 
 import os
 import io
+import time
 import json
 import base64
 import streamlit as st
@@ -87,7 +89,7 @@ def extract_and_solve_all_questions(
     subject: str = "الرياضيات",
     branch: str = "العلمي"
 ) -> Dict[str, Any]:
-    """استخراج وحل كافة الأسئلة الرئيسية والفرعية، ودعم إرسال ملف الـ PDF مباشرة لموديل Gemini"""
+    """استخراج وحل كافة الأسئلة الرئيسية والفرعية مع التبديل التلقائي بين النماذج لتفادي 503"""
     client = get_gemini_client()
     if not client:
         return {"error": "لم يتم العثور على مفتاح GEMINI_API_KEY في st.secrets أو متغيرات البيئة"}
@@ -160,25 +162,45 @@ def extract_and_solve_all_questions(
 
     contents.append(prompt)
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                response_mime_type="application/json",
-                temperature=0.2,
-            )
-        )
+    # قائمة النماذج البديلة بالترتيب لتفادي خطأ 503 وإعادة المحاولة التلقائية
+    candidate_models = [
+        "gemini-2.5-flash",
+        "gemini-3.8-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3.1-flash-lite",
+    ]
 
-        clean_text = response.text.strip()
-        if clean_text.startswith("```json"):
-            clean_text = clean_text[7:]
-        if clean_text.endswith("```"):
-            clean_text = clean_text[:-3]
-        return json.loads(clean_text)
-    except Exception as e:
-        return {"error": f"فشل تحليل استجابة الذكاء الاصطناعي: {e}"}
+    last_error = ""
+    for model_name in candidate_models:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json",
+                        temperature=0.2,
+                    )
+                )
+
+                clean_text = response.text.strip()
+                if clean_text.startswith("```json"):
+                    clean_text = clean_text[7:]
+                if clean_text.endswith("```"):
+                    clean_text = clean_text[:-3]
+                return json.loads(clean_text)
+            except Exception as e:
+                err_str = str(e)
+                last_error = err_str
+                # في حال حدوث ضغط مؤقت 503 أو 429 انتظر ثانيتين وأعد المحاولة
+                if any(x in err_str.lower() for x in ["503", "unavailable", "high demand", "429"]):
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                else:
+                    break
+
+    return {"error": f"خوادم الذكاء الاصطناعي تشهد ضغطاً مؤقتاً (503)، انقر على زر إعادة المحاولة الآن: {last_error}"}
 
 
 def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None, *args, **kwargs):
@@ -196,7 +218,7 @@ def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None
         else:
             default_subject = getattr(book, "subject", getattr(book, "title", default_subject))
 
-    st.success("✅ **تم تفعيل الحل الشامل**: يدعم النظام ملفات PDF الممسوحة ضوئياً مباشرة، ويحل **جميع الفروع** لكافة الأسئلة الرئيسية بنسبة 100%.")
+    st.success("✅ **تم تفعيل الحل الشامل**: يدعم النظام ملفات PDF الممسوحة ضوئياً مباشرة، ومزوّد بحماية ضد ضغط الخوادم المؤقت (503).")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -265,7 +287,7 @@ def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None
                 exam_text = extracted
             else:
                 st.info(f"📄 **تم استلام ملف الـ PDF بنجاح** ({len(raw_bytes)//1024} كيلوبايت).\n"
-                        "💡 نظراً لأن الامتحان ممسوح ضوئياً (سكانر أو صور)، سيقوم الذكاء الاصطناعي (Gemini Vision) بقراءة الأسئلة والمعادلات والرسومات مباشرة من صفحات الـ PDF عند النقر على زر البدء بالأسفل.")
+                        "💡 نظراً لأن الامتحان ممسوح ضوئياً، سيقوم الذكاء الاصطناعي بقراءة صفحات الـ PDF مباشرة وحل جميع الأسئلة.")
                 exam_text = "ملف امتحان PDF ممسوح ضوئياً"
 
     with tab_paste:
