@@ -482,7 +482,7 @@ elif action == "qbank":
                         subject_scope=acc.qbank_subject_scope(user), user=user)
 
 elif action == "ministry":
-    render_ministry(book, flat_lessons, user, lang)
+    render_ministry(book, flat_lessons, user, lang, idx)
 
 # ---------------------------------------------------------------- الشروط الاحتياطية
 else:

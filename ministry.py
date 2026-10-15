@@ -30,7 +30,7 @@ import catalog
 import images
 import qbank
 from config import BASE, GEMINI_MODEL
-from rag import _norm, get_client
+from rag import _norm, get_client, select_context
 
 LOCAL_FILE = BASE / "data" / "ministry.json"
 TIMEOUT = 20
@@ -442,28 +442,28 @@ def extract(client, text, image):
 ANSWER_SYSTEM = (
     "You are an expert teacher answering past Ministry exam questions. A human reviewer will check your answers before "
     "they are approved. Rules:\n"
-    "1) LANGUAGE: every item has an \"answer_language\" field. Write \"note\" and any free-text \"answer\" in that language "
-    "(English questions -> English; Arabic questions -> Arabic). Never answer an English question in Arabic.\n"
-    "2) For an item with a passage_key, answer from the matching text in \"passages\" only.\n"
+    "1) LANGUAGE: every item has an \"answer_language\" field. Write \"note\" and any free-text \"answer\" ONLY in that language "
+    "(English -> English; Arabic -> Arabic). Never write Arabic for an English item, even if other text is Arabic.\n"
+    "2) For an item with a passage_key, answer from the matching text in \"passages\" only, and set source_pages to [].\n"
     "3) type mcq: you MUST choose exactly one of the given options. Return correct_index (0-based position in options) AND "
-    "correct_option_text (copy the chosen option exactly as written). Never leave an mcq without a chosen option unless you "
-    "truly cannot decide.\n"
+    "correct_option_text (copy the chosen option exactly as written).\n"
     "4) type tf: return correct (true or false). Types fill and short: return answer, a brief correct answer "
     "(for fill: only the missing word or phrase).\n"
     "5) Text inside [[ ]] was underlined in the original exam and is often what the question is about.\n"
-    "6) If you are not sure, set the answer fields to null and confidence to \"low\". Do not guess or invent.\n"
-    "7) confidence is high, medium or low. note is one short sentence explaining why.\n"
-    "Return JSON only."
-)
+    "6) If an item has book_excerpts (pages of the textbook), use them as the primary evidence: set source_pages to the "
+    "page numbers of the excerpts that support the answer (ONLY numbers present in that item's book_excerpts). If the "
+    "excerpts do not contain the answer, answer from general knowledge and set source_pages to [].\n"
+    "7) If you are not sure, set the answer fields to null and confidence to \"low\". Do not guess or invent.\n"
+    "8) confidence is high, medium or low. note is one short sentence explaining why, in answer_language.\n"
+    "Return one JSON object per item, in a JSON list, and cover EVERY item.")
 ANSWER_TYPES = ("mcq", "tf", "fill", "short")
+_AR = re.compile(r"[\u0600-\u06FF\u0750-\u077F]")
 
 
 def _lang_name(*texts):
     """لغة السؤال (للتعليمات): Arabic إن غلبت الحروف العربية وإلا English."""
     t = " ".join(str(x) for x in texts if x)
-    ar = len(re.findall(r"[\u0600-\u06FF]", t))
-    la = len(re.findall(r"[A-Za-z]", t))
-    return "Arabic" if ar > la else "English"
+    return "Arabic" if len(_AR.findall(t)) > len(re.findall(r"[A-Za-z]", t)) else "English"
 
 
 def _pick_option(v, options):
@@ -496,61 +496,135 @@ def _pick_option(v, options):
     if isinstance(ci, int) and not isinstance(ci, bool) and 0 <= ci < n:
         by_int = ci
     chosen = by_text if by_text is not None else (by_letter if by_letter is not None else by_int)
-    conflict = by_text is not None and by_int is not None and by_text != by_int
-    return chosen, conflict
+    return chosen, (by_text is not None and by_int is not None and by_text != by_int)
 
 
-def suggest_answers(client, rows):
-    """يقترح إجابات لأسئلة (rows: [{id, qtype, data}]) بطلب واحد لكل 30 سؤالًا.
-    يعيد {id: بيانات الإجابة المقترحة} لما استطاع فقط. لا يُجيب عن المقالي والمطابقة وغيرها."""
+def _best_window(text, query, size=800):
+    """أنسب مقطع (~size حرف) من صفحة لسؤال معيّن (تداخل الكلمات) كي لا تُرسَل الصفحة كلها."""
+    if len(text) <= size:
+        return text
+    words = {w for w in re.findall(r"\w+", query.lower()) if len(w) > 3}
+    best, best_i, step = -1, 0, max(size // 4, 100)
+    low = text.lower()
+    for i in range(0, max(len(text) - size, 0) + step, step):
+        sc = sum(1 for w in words if w in low[i:i + size])
+        if sc > best:
+            best, best_i = sc, i
+    return text[best_i:best_i + size]
+
+
+def _excerpts(ctx, d, k=2):
+    """أقرب صفحات الكتاب لسؤال: [{"page": رقم مطبوع, "text": مقطع}] أو [] إن لم يتوفر فهرس الكتاب."""
+    if not ctx or not ctx.get("idx") or d.get("passage"):
+        return []
+    query = d["question"] + " " + " ".join(d.get("options") or [])
+    try:
+        pages = select_context(ctx["idx"], query, None, max_chars=3000, k=k)[:k]
+    except Exception:  # noqa: BLE001
+        return []
+    off = ctx.get("offset", 0)
+    return [{"page": p["page"] - off, "text": _best_window(p["text"], query)} for p in pages]
+
+
+def _lesson_of(ctx, printed_page):
+    pdf = printed_page + (ctx or {}).get("offset", 0)
+    for l in (ctx or {}).get("lessons") or []:
+        if l["start"] <= pdf <= l["end"]:
+            return l["title"]
+    return None
+
+
+def _list_from(data):
+    if isinstance(data, dict):
+        for key in ("results", "answers", "items", "data"):
+            if isinstance(data.get(key), list):
+                return data[key]
+        lists = [v for v in data.values() if isinstance(v, list)]
+        return lists[0] if lists else []
+    return data if isinstance(data, list) else []
+
+
+def _ask_answers(client, chunk, ctx):
+    """طلب واحد لمجموعة أسئلة. يعيد {معرّف السؤال: نتيجة}."""
+    passages, items, by_n, pages_of = {}, [], {}, {}
+    for n, r in enumerate(chunk, start=1):
+        d = r["data"]
+        lang = _lang_name(d["question"], d.get("passage"))
+        pk = None
+        if d.get("passage"):
+            pk = d.get("passage_key") or f"p{r['id']}"
+            passages[pk] = d["passage"]
+        instr = d.get("instruction") or None
+        if instr and lang == "English":                 # تعليمات عربية طويلة تدفع النموذج للرد بالعربية
+            instr = re.sub(r"\s+", " ", _AR.sub("", re.sub(r"[\u0600-\u06FF\u0750-\u077F]+", "", instr))).strip(" .,:;()-")
+        ex = _excerpts(ctx, d)
+        pages_of[n] = {e["page"] for e in ex}
+        by_n[n] = r
+        item = {"n": n, "type": r["qtype"], "answer_language": lang, "instruction": instr or None,
+                "passage_key": pk, "question": d["question"], "options": d.get("options")}
+        if ex:
+            item["book_excerpts"] = ex
+        items.append(item)
+    prompt = (f"passages:\n{json.dumps(passages, ensure_ascii=False)}\n\nitems:\n{json.dumps(items, ensure_ascii=False)}\n\n"
+              'Return a JSON list with one object per item: [{"n":1,"correct_index":1,"correct_option_text":"exact option text",'
+              '"correct":null,"answer":null,"source_pages":[],"confidence":"high","note":"one short sentence in answer_language"}]. '
+              "IMPORTANT: cover every item; write notes in each item's answer_language.")
     out = {}
-    cand = [r for r in rows if r["qtype"] in ANSWER_TYPES]
-    for s in range(0, len(cand), 30):
-        chunk, passages, items = cand[s:s + 30], {}, []
-        for r in chunk:
-            d = r["data"]
-            pk = None
-            if d.get("passage"):
-                pk = d.get("passage_key") or f"p{r['id']}"
-                passages[pk] = d["passage"]
-            items.append({"id": r["id"], "type": r["qtype"], "answer_language": _lang_name(d["question"], d.get("passage")),
-                          "instruction": d.get("instruction"), "passage_key": pk, "question": d["question"],
-                          "options": d.get("options")})
-        prompt = (f"passages:\n{json.dumps(passages, ensure_ascii=False)}\n\n"
-                  f"items:\n{json.dumps(items, ensure_ascii=False)}\n\n"
-                  'Return a JSON list, one object per item: [{"id":12,"correct_index":1,"correct_option_text":"exact option text",'
-                  '"correct":null,"answer":null,"confidence":"high","note":"one short sentence"}]')
-        data = _ask_json(client, ANSWER_SYSTEM, prompt)
-        by_id = {r["id"]: r for r in chunk}
-        for v in (data if isinstance(data, list) else []):
-            r = by_id.get(v.get("id")) if isinstance(v, dict) else None
-            if not r:
+    for v in _list_from(_ask_json(client, ANSWER_SYSTEM, prompt)):
+        if not isinstance(v, dict):
+            continue
+        key = v.get("n", v.get("id"))
+        key = int(key) if isinstance(key, str) and key.strip().isdigit() else key
+        r = by_n.get(key)
+        if not r:
+            continue
+        d, qt = r["data"], r["qtype"]
+        conf = v.get("confidence") if v.get("confidence") in ("high", "medium", "low") else "low"
+        res = {"ai_answer": True, "ai_conf": conf, "ai_note": str(v.get("note") or "").strip()[:300] or None}
+        if _lang_name(d["question"], d.get("passage")) == "English" and res["ai_note"] and _AR.search(res["ai_note"]):
+            res["ai_note"] = None                         # ملاحظة عربية لسؤال إنجليزي: تُهمَل
+        if qt == "mcq":
+            idx, conflict = _pick_option(v, d.get("options") or [])
+            if idx is None:
                 continue
-            conf = v.get("confidence") if v.get("confidence") in ("high", "medium", "low") else "low"
-            res = {"ai_answer": True, "ai_conf": conf, "ai_note": str(v.get("note") or "").strip()[:300] or None}
-            qt = r["qtype"]
-            if qt == "mcq":
-                idx, conflict = _pick_option(v, r["data"].get("options") or [])
-                if idx is None:
-                    continue
-                if conflict:                      # نص الخيار لا يطابق رقمه: نثق بالنص ونخفض الثقة
-                    res["ai_conf"] = "low"
-                res["correct_index"] = idx
-            elif qt == "tf":
-                if not isinstance(v.get("correct"), bool):
-                    continue
-                res["correct"] = v["correct"]
-            else:
-                ans = str(v.get("answer") or "").strip()
-                if not ans:
-                    continue
-                res["model_answer"] = ans
-            out[r["id"]] = res
+            res["correct_index"] = idx
+            if conflict:
+                res["ai_conf"] = "low"
+        elif qt == "tf":
+            if not isinstance(v.get("correct"), bool):
+                continue
+            res["correct"] = v["correct"]
+        else:
+            ans = str(v.get("answer") or "").strip()
+            if not ans:
+                continue
+            res["model_answer"] = ans
+        sp = sorted({int(p) for p in (v.get("source_pages") or []) if isinstance(p, (int, float, str))
+                     and str(p).strip().lstrip("-").isdigit() and int(p) in pages_of[key]})
+        if sp:
+            res["source_pages"] = sp
+            res["ai_lessons"] = [t for t in dict.fromkeys(_lesson_of(ctx, p) for p in sp) if t]
+        out[r["id"]] = res
     return out
 
 
-def _apply_ai(user, rows, replace_existing=False):
-    """يطلب الإجابات ويحفظها في المسوّدات (علامة ai_answer تبقى حتى يعتمدها مراجع) ويعيد عدد ما حُفظ."""
+def suggest_answers(client, rows, ctx=None):
+    """يقترح إجابات (rows: [{id, qtype, data}]) مع الصفحات والدروس التي أُخذت منها إن توفر فهرس الكتاب (ctx).
+    يجرّب مرة ثانية على الأسئلة التي سقطت من الرد الأول. لا يُجيب عن المقالي والمطابقة وغيرهما."""
+    out = {}
+    cand = [r for r in rows if r["qtype"] in ANSWER_TYPES]
+    size = 10 if (ctx and ctx.get("idx")) else 30
+    for s in range(0, len(cand), size):
+        chunk = cand[s:s + size]
+        out.update(_ask_answers(client, chunk, ctx))
+        missing = [r for r in chunk if r["id"] not in out]
+        if missing:                                        # جولة ثانية للناقص فقط
+            out.update(_ask_answers(client, missing, ctx))
+    return out
+
+
+def _apply_ai(user, rows, replace_existing=False, ctx=None):
+    """يطلب الإجابات ويحفظها في المسوّدات (علامة ai_answer تبقى حتى يعتمدها مراجع) ويعيد (المحفوظ، المطلوب)."""
     todo = []
     for r in rows:
         d = r["data"]
@@ -561,12 +635,17 @@ def _apply_ai(user, rows, replace_existing=False):
     if not todo:
         return 0, 0
     auth_ui.require_quota_or_stop(user)
-    res = suggest_answers(get_client(), todo)
+    res = suggest_answers(get_client(), todo, ctx)
     for r in todo:
-        if r["id"] in res:
-            update_question(r["id"], {"data": {**r["data"], **res[r["id"]]}})
-            for suffix in ("c", "a"):                       # لتتحدّث عناصر الإجابة في الشاشة
-                st.session_state.pop(f"mr_{r['id']}_{suffix}", None)
+        if r["id"] not in res:
+            continue
+        got = res[r["id"]]
+        patch = {"data": {**r["data"], **{k: v for k, v in got.items() if k != "ai_lessons"}, "ai_lessons": got.get("ai_lessons")}}
+        if got.get("ai_lessons") and not r.get("lesson_title"):
+            patch["lesson_title"] = got["ai_lessons"][0]
+        update_question(r["id"], patch)
+        for suffix in ("c", "a", "sp", "l"):                # لتتحدّث عناصر الشاشة
+            st.session_state.pop(f"mr_{r['id']}_{suffix}", None)
     return len(res), len(todo)
 
 
@@ -809,7 +888,7 @@ def _upload_section(book, flat_lessons, user):
         st.error("لم يُستخرج أي سؤال. تأكد من وضوح الملفات.")
 
 
-def _review_section(book, flat_lessons, user, lang):
+def _review_section(book, flat_lessons, user, lang, idx=None):
     slug = book["slug"]
     exams = list_exams(slug)
     if exams:
@@ -851,12 +930,13 @@ def _review_section(book, flat_lessons, user, lang):
         st.session_state[pkey] = page + 1
         st.rerun()
     page_items = drafts[(page - 1) * size: page * size]
+    ai_ctx = {"idx": idx, "offset": book.get("page_offset", 0), "lessons": flat_lessons}
     # ---- اقتراح الإجابات بالذكاء الاصطناعي للأسئلة المعروضة في هذه الصفحة
     ai_c1, ai_c2 = st.columns([3, 2])
     replace_all = ai_c2.checkbox("استبدال الإجابات الموجودة", key=f"mairep_{slug}")
     if ai_c1.button(f"🤖 اقتراح إجابات للأسئلة المعروضة ({len(page_items)})", key=f"maiall_{slug}"):
         with st.spinner("جارٍ اقتراح الإجابات..."):
-            done_n, tried = _apply_ai(user, page_items, replace_all)
+            done_n, tried = _apply_ai(user, page_items, replace_all, ai_ctx)
         st.session_state[f"mainote_{slug}"] = (f"اقتُرحت إجابات لـ {done_n} من {tried} سؤالًا. راجعها قبل الاعتماد."
                                                if tried else "لا توجد أسئلة تحتاج إجابة في هذه الصفحة.")
         st.rerun()
@@ -908,57 +988,99 @@ def _review_section(book, flat_lessons, user, lang):
                                           format_func=lambda i, o=opts_l: o[i], key=f"{k}_pl")
                     if pick_l > 0:
                         link_choice = list(others.items())[pick_l - 1]
-            d["question"] = st.text_area("نص السؤال", d["question"], key=f"{k}_q")
-            if q["qtype"] == "mcq":
-                opts = [o.strip() for o in st.text_area("الخيارات (خيار في كل سطر)", "\n".join(d.get("options") or []),
-                                                        key=f"{k}_o").splitlines() if o.strip()]
-                d["options"] = opts
-                labels = ["غير محددة"] + [f"{letters[i]}) {o}" for i, o in enumerate(opts[:5])]
-                cur = (d.get("correct_index") + 1) if d.get("correct_index") is not None and d["correct_index"] < len(opts) else 0
-                pick = st.selectbox("الإجابة الصحيحة", range(len(labels)), index=cur,
-                                    format_func=lambda i, L=labels: L[i], key=f"{k}_c")
-                d["correct_index"] = (pick - 1) if pick > 0 else None
-            elif q["qtype"] == "tf":
-                cur = {None: 0, True: 1, False: 2}[d.get("correct")]
-                pick = st.selectbox("الحكم الصحيح", ["غير محدد", "صح", "خطأ"], index=cur, key=f"{k}_c")
-                d["correct"] = {"غير محدد": None, "صح": True, "خطأ": False}[pick]
-            else:
-                d["model_answer"] = st.text_area("الإجابة النموذجية (اختياري)", d.get("model_answer") or "",
-                                                 key=f"{k}_a").strip() or None
+            preview = st.container()          # ملخّص السؤال والإجابة والمصدر؛ يُملأ بعد قراءة الحقول أدناه
+
+            with st.expander("✏️ تعديل نص السؤال" + (" والخيارات" if q["qtype"] == "mcq" else "")):
+                d["question"] = st.text_area("نص السؤال", d["question"], key=f"{k}_q")
+                if q["qtype"] == "mcq":
+                    opts = [o.strip() for o in st.text_area("الخيارات (خيار في كل سطر)", "\n".join(d.get("options") or []),
+                                                            key=f"{k}_o").splitlines() if o.strip()]
+                    d["options"] = opts
+            opts = d.get("options") or []
             if q["qtype"] in ANSWER_TYPES:
-                if d.get("ai_answer"):
+                with st.expander("✏️ تعديل الإجابة"):
+                    if q["qtype"] == "mcq":
+                        labels = ["غير محددة"] + [f"{letters[i]}) {o}" for i, o in enumerate(opts[:5])]
+                        cur = (d.get("correct_index") + 1) if d.get("correct_index") is not None and d["correct_index"] < len(opts) else 0
+                        pick = st.selectbox("الإجابة الصحيحة", range(len(labels)), index=cur,
+                                            format_func=lambda i, L=labels: L[i], key=f"{k}_c")
+                        d["correct_index"] = (pick - 1) if pick > 0 else None
+                    elif q["qtype"] == "tf":
+                        cur = {None: 0, True: 1, False: 2}[d.get("correct")]
+                        pick = st.selectbox("الحكم الصحيح", ["غير محدد", "صح", "خطأ"], index=cur, key=f"{k}_c")
+                        d["correct"] = {"غير محدد": None, "صح": True, "خطأ": False}[pick]
+                    else:
+                        d["model_answer"] = st.text_area("الإجابة النموذجية", d.get("model_answer") or "",
+                                                         key=f"{k}_a").strip() or None
+            else:
+                with st.expander("✏️ تعديل الإجابة النموذجية (اختياري)"):
+                    d["model_answer"] = st.text_area("الإجابة النموذجية", d.get("model_answer") or "",
+                                                     key=f"{k}_a").strip() or None
+            with st.expander("📍 الصفحات والدروس التي أُخذت منها الإجابة"):
+                sp_default = ", ".join(str(p) for p in (d.get("source_pages") or []))
+                sp_raw = st.text_input("أرقام الصفحات المطبوعة في الكتاب (مفصولة بفواصل)", sp_default, key=f"{k}_sp",
+                                       help="الأرقام المطبوعة على صفحات الكتاب نفسها. تُنقل مع السؤال إلى بنك «قيّمني».")
+                d["source_pages"] = sorted({int(x) for x in re.findall(r"\d+", sp_raw)})
+                cur_l = lesson_titles.index(q["lesson_title"]) if q.get("lesson_title") in lesson_titles else 0
+                les = st.selectbox("الدرس المرتبط", lesson_titles, index=cur_l, key=f"{k}_l")
+            with st.expander("🖼️ صورة السؤال والعلامة"):
+                rm_img, up_img = False, None
+                if d.get("image_id"):
+                    cur_img = images.load(d["image_id"])
+                    if cur_img:
+                        st.image(cur_img, width=320)
+                    rm_img = st.checkbox("حذف صورة السؤال", key=f"{k}_rmimg")
+                up_img = st.file_uploader("إضافة أو استبدال صورة السؤال (اختياري)", type=["png", "jpg", "jpeg"], key=f"{k}_img")
+                d["marks"] = st.number_input("العلامة", 0.0, 100.0, float(d.get("marks") or 0.0), 0.5, key=f"{k}_m") or None
+
+            # ---- الملخّص (بالقيم الحالية في الحقول)
+            with preview:
+                st.markdown(_box(d["question"], lang, bold=True), unsafe_allow_html=True)
+                if d.get("image_id"):
+                    _pi = images.load(d["image_id"])
+                    if _pi:
+                        st.image(_pi, width=260)
+                if q["qtype"] == "mcq":
+                    for i, o in enumerate(opts[:5]):
+                        mark = "✅ " if d.get("correct_index") == i else ""
+                        st.markdown(_box(f"{mark}{letters[i]}) {o}", lang), unsafe_allow_html=True)
+                    if d.get("correct_index") is None:
+                        st.caption("— لم تُحدَّد الإجابة الصحيحة بعد —")
+                elif q["qtype"] == "tf":
+                    st.markdown("الإجابة: " + {None: "— غير محددة —", True: "**صح**", False: "**خطأ**"}[d.get("correct")])
+                elif d.get("model_answer"):
+                    st.markdown("**الإجابة:** ")
+                    st.markdown(_box(d["model_answer"], lang), unsafe_allow_html=True)
+                src_bits = []
+                if d.get("source_pages"):
+                    src_bits.append("صفحة " + "، ".join(str(p) for p in d["source_pages"]))
+                lesson_now = None if les == lesson_titles[0] else les
+                if lesson_now:
+                    src_bits.append(lesson_now)
+                if src_bits:
+                    st.caption("📍 المصدر: " + " — ".join(src_bits))
+                if q["qtype"] in ANSWER_TYPES and d.get("ai_answer"):
                     conf = {"high": "عالية", "medium": "متوسطة", "low": "منخفضة"}.get(d.get("ai_conf"), "")
-                    pick_txt = ""
-                    if q["qtype"] == "mcq" and d.get("correct_index") is not None and d["correct_index"] < len(d.get("options") or []):
-                        pick_txt = f"الخيار المقترح: **{letters[d['correct_index']]}) {d['options'][d['correct_index']]}** — "
-                    st.warning(f"🤖 {pick_txt}إجابة مقترحة من الذكاء الاصطناعي (الثقة: {conf})"
+                    st.warning(f"🤖 إجابة مقترحة من الذكاء الاصطناعي (الثقة: {conf})"
                                + (f" — {d['ai_note']}" if d.get("ai_note") else "") + ". راجعها وعدّلها إن لزم قبل الاعتماد.")
-                if st.button("🤖 اقتراح الإجابة لهذا السؤال", key=f"{k}_ai"):
-                    now_row = {"id": q["id"], "qtype": q["qtype"],
-                               "data": {**q["data"], "question": d["question"], "options": d.get("options"),
-                                        "passage": (link_choice[1] if link_choice else d_pass.strip()) or None}}
-                    with st.spinner("جارٍ اقتراح الإجابة..."):
-                        got_n, _t = _apply_ai(user, [now_row], replace_existing=True)
-                    st.session_state[f"mainote_{slug}"] = ("اقتُرحت إجابة للسؤال؛ راجعها." if got_n
-                                                           else "لم يستطع الذكاء الاصطناعي تحديد إجابة موثوقة لهذا السؤال.")
-                    st.rerun()
-            rm_img, up_img = False, None
-            if d.get("image_id"):
-                cur_img = images.load(d["image_id"])
-                if cur_img:
-                    st.image(cur_img, width=320)
-                rm_img = st.checkbox("حذف صورة السؤال", key=f"{k}_rmimg")
-            up_img = st.file_uploader("إضافة أو استبدال صورة السؤال (اختياري)", type=["png", "jpg", "jpeg"], key=f"{k}_img")
-            c1, c2 = st.columns(2)
-            d["marks"] = c1.number_input("العلامة", 0.0, 100.0, float(d.get("marks") or 0.0), 0.5, key=f"{k}_m") or None
-            cur_l = lesson_titles.index(q["lesson_title"]) if q.get("lesson_title") in lesson_titles else 0
-            les = c2.selectbox("الدرس", lesson_titles, index=cur_l, key=f"{k}_l")
+
+            if q["qtype"] in ANSWER_TYPES and st.button("🤖 اقتراح الإجابة والمصدر لهذا السؤال", key=f"{k}_ai"):
+                now_row = {"id": q["id"], "qtype": q["qtype"], "lesson_title": q.get("lesson_title"),
+                           "data": {**q["data"], "question": d["question"], "options": d.get("options"),
+                                    "passage": (link_choice[1] if link_choice else d_pass.strip()) or None}}
+                with st.spinner("جارٍ اقتراح الإجابة..."):
+                    got_n, _t = _apply_ai(user, [now_row], replace_existing=True, ctx=ai_ctx)
+                st.session_state[f"mainote_{slug}"] = ("اقتُرحت إجابة للسؤال؛ راجعها." if got_n
+                                                       else "لم يستطع الذكاء الاصطناعي تحديد إجابة موثوقة لهذا السؤال.")
+                st.rerun()
             b1, b2 = st.columns(2)
 
             def _patch(d=d, les=les, up_img=up_img, rm_img=rm_img, d_pass=d_pass, link_choice=link_choice,
                        orig_passage=orig_passage, q=q, siblings_all=siblings_all):
-                for _f in ("ai_answer", "ai_conf", "ai_note"):    # اعتمده مراجع بشري
+                for _f in ("ai_answer", "ai_conf", "ai_note", "ai_lessons"):    # اعتمده مراجع بشري
                     d.pop(_f, None)
+                if not d.get("source_pages"):
+                    d.pop("source_pages", None)
                 key = d.get("passage_key")
                 if link_choice:                                  # ربط بنص موجود
                     key, final = link_choice
@@ -993,7 +1115,7 @@ def _review_section(book, flat_lessons, user, lang):
                 st.rerun()
 
 
-def to_qbank_item(row, lesson_ranges):
+def to_qbank_item(row, lesson_ranges, page_offset=0):
     """سؤال وزاري معتمد → (qtype, page_start, page_end, بيانات السؤال بصيغة بنك قيّمني) أو (None, سبب الاستبعاد)."""
     d, qt = row["data"], row["qtype"]
     if qt not in ("mcq", "tf", "fill", "short"):
@@ -1005,6 +1127,8 @@ def to_qbank_item(row, lesson_ranges):
          "ministry_id": row["id"]}
     if d.get("image_id"):
         q["image_id"] = d["image_id"]
+    if d.get("source_pages"):                  # الصفحة المصدر بترقيم ملف الكتاب (كما يخزّنها بنك الأسئلة الأخرى)
+        q["page"] = int(d["source_pages"][0]) + int(page_offset or 0)
     if d.get("passage"):                       # السؤال الفرعي ينتقل مع نصه الرئيسي ليُفهم وحده
         q["passage"] = d["passage"]
         q["passage_key"] = d.get("passage_key") or f"p{row['id']}"
@@ -1037,7 +1161,7 @@ def _transfer_section(book, flat_lessons, user):
     done = [r for r in approved if r.get("transferred_at")]
     ok, bad = [], {}
     for r in pending:
-        item, why = to_qbank_item(r, ranges)
+        item, why = to_qbank_item(r, ranges, book.get("page_offset", 0))
         if item:
             ok.append((r, item))
         else:
@@ -1101,7 +1225,7 @@ def _style_section(book, user, lang):
         st.caption(f"يلزم {MIN_FOR_STYLE} أسئلة معتمدة على الأقل.")
 
 
-def render_ministry(book, flat_lessons, user, lang="ar"):
+def render_ministry(book, flat_lessons, user, lang="ar", idx=None):
     st.subheader("📜 أسئلة وزارية سابقة")
     can_manage = _can_manage(user, book)
     if not can_manage:
@@ -1116,7 +1240,7 @@ def render_ministry(book, flat_lessons, user, lang="ar"):
     with t2:
         _upload_section(book, flat_lessons, user)
         st.markdown("---")
-        _review_section(book, flat_lessons, user, lang)
+        _review_section(book, flat_lessons, user, lang, idx)
     with t4:
         _transfer_section(book, flat_lessons, user)
     with t3:
