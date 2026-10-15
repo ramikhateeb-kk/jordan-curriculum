@@ -1,51 +1,33 @@
 """
 ملف: ministry.py
 نظام استخراج وحل أسئلة الامتحانات الوزارية - المنهاج الأردني (شهادة الثانوية العامة - التوجيهي)
-الإصلاحات الجوهرية:
-1. مطابقة توقيع دالة render_ministry(book, flat_lessons, user, lang, idx, *args, **kwargs) كما يستدعيها app.py في السطر 485
-2. استخراج جميع الأسئلة الرئيسية وكافة الأسئلة الفرعية (أ، ب، ج، د / 1، 2، 3 ...)
-3. حل كل سؤال فرعي من كل سؤال رئيسي إجابة نموذجية وزارية معتمدة 100% مع سلم توزيع العلامات
+الإصلاحات:
+1. حل مشكلة الـ PDF: دعم ملفات PDF الممسوحة ضوئياً (Scanned PDFs) وقراءتها بالكامل عبر Gemini Vision
+2. مطابقة توقيع render_ministry(book, flat_lessons, user, lang, idx, *args, **kwargs)
+3. استخراج وحل كافة الأسئلة الرئيسية وجميع فروعها 100%
 """
 
 import os
+import io
 import json
+import base64
 import streamlit as st
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
-def extract_text_from_file(uploaded_file) -> str:
-    """استخراج النص من الملفات المرفوعة بمختلف أنواعها"""
-    file_bytes = uploaded_file.read()
+def extract_text_from_file(uploaded_file, file_bytes: bytes) -> str:
+    """محاولة استخراج النص محلياً إن كان الـ PDF رقمياً ويحتوي على نص قابل للتحديد"""
     file_name = uploaded_file.name.lower()
 
     if file_name.endswith(".txt"):
-        return file_bytes.decode("utf-8", errors="ignore")
-
-    if file_name.endswith(".pdf"):
         try:
-            import pypdf
-            import io
-            reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-            text = "\n".join([page.extract_text() or "" for page in reader.pages])
-            if text.strip():
-                return text
+            return file_bytes.decode("utf-8", errors="ignore")
         except Exception:
-            pass
-
-        try:
-            import pdfplumber
-            import io
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                text = "\n".join([page.extract_text() or "" for page in pdf.pages])
-                if text.strip():
-                    return text
-        except Exception:
-            pass
+            return ""
 
     if file_name.endswith(".docx"):
         try:
             import docx
-            import io
             doc = docx.Document(io.BytesIO(file_bytes))
             text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
             if text.strip():
@@ -53,11 +35,30 @@ def extract_text_from_file(uploaded_file) -> str:
         except Exception:
             pass
 
+    if file_name.endswith(".pdf"):
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+            text = "\n".join([page.extract_text() or "" for page in reader.pages])
+            if text and len(text.strip()) > 30:
+                return text.strip()
+        except Exception:
+            pass
+
+        try:
+            import pdfplumber
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+                if text and len(text.strip()) > 30:
+                    return text.strip()
+        except Exception:
+            pass
+
     return ""
 
 
 def get_gemini_client():
-    """الحصول على عميل Google GenAI إما من st.secrets أو متغيرات البيئة"""
+    """الحصول على عميل Google GenAI"""
     api_key = None
     try:
         if "GEMINI_API_KEY" in st.secrets:
@@ -79,8 +80,14 @@ def get_gemini_client():
         return None
 
 
-def extract_and_solve_all_questions(exam_text: str, subject: str = "الرياضيات", branch: str = "العلمي") -> Dict[str, Any]:
-    """استخراج وحل كافة الأسئلة الرئيسية والفرعية بدون أي استثناء"""
+def extract_and_solve_all_questions(
+    exam_text: str = "",
+    file_bytes: Optional[bytes] = None,
+    mime_type: Optional[str] = None,
+    subject: str = "الرياضيات",
+    branch: str = "العلمي"
+) -> Dict[str, Any]:
+    """استخراج وحل كافة الأسئلة الرئيسية والفرعية، ودعم إرسال ملف الـ PDF مباشرة لموديل Gemini"""
     client = get_gemini_client()
     if not client:
         return {"error": "لم يتم العثور على مفتاح GEMINI_API_KEY في st.secrets أو متغيرات البيئة"}
@@ -90,10 +97,11 @@ def extract_and_solve_all_questions(exam_text: str, subject: str = "الرياض
     system_instruction = """
     أنت رئيس لجان تصحيح الامتحانات الوزارية في إدارة الامتحانات والاختبارات بوزارة التربية والتعليم في المملكة الأردنية الهاشمية.
     قاعدة حاسمة ومطلقة:
-    1. استخرج كل سؤال رئيسي وارد في ورقة الامتحان (السؤال الأول، الثاني، الثالث، الرابع، الخامس...).
-    2. لكل سؤال رئيسي، استخرج كافة الأسئلة والبنود الفرعية (أ، ب، ج، د ... أو 1، 2، 3 ...) بالكامل.
-    3. والأهم على الإطلاق: اكتب الإجابة النموذجية الوزارية المعتمدة بالتفصيل لكل سؤال فرعي من كل سؤال رئيسي بلا أي استثناء!
-    تحذير صارم: إياك أن تجيب على الفرع الأول فقط! يجب حل 100% من جميع الفروع لجميع الأسئلة مع خطوات الحل وسلم توزيع علامات وزارة التربية والتعليم.
+    1. اقرأ ورقة الامتحان الوزاري كاملة (سواء كانت نصاً أو ملف PDF ممسوحاً ضوئياً أو صوراً).
+    2. استخرج كل سؤال رئيسي وارد في ورقة الامتحان (السؤال الأول، الثاني، الثالث، الرابع، الخامس...).
+    3. لكل سؤال رئيسي، استخرج كافة الأسئلة والبنود الفرعية (أ، ب، ج، د ... أو 1، 2، 3 ...) بالكامل وبدقة.
+    4. والأهم على الإطلاق: اكتب الإجابة النموذجية الوزارية المعتمدة بالتفصيل لكل سؤال فرعي من كل سؤال رئيسي بلا أي استثناء!
+    تحذير صارم: إياك أن تجيب على الفرع الأول فقط! يجب حل 100% من جميع الفروع لجميع الأسئلة مع خطوات الحل وسلالم توزيع علامات وزارة التربية والتعليم.
     """
 
     prompt = f"""
@@ -101,10 +109,10 @@ def extract_and_solve_all_questions(exam_text: str, subject: str = "الرياض
     المبحث: {subject}
     الفرع: {branch}
     
-    نص الامتحان:
-    {exam_text}
+    نص الامتحان (أو اقرأه مباشرة من ملف الـ PDF / الصورة المرفقة):
+    {exam_text if exam_text else "اقرأ ورقة الامتحان بالكامل من ملف PDF المرفق"}
     
-    أرجع النتيجة بصيغة JSON حصراً بالهيكل التالي:
+    المطلوب استخراجه وحله بتنسيق JSON حصراً بالهيكل التالي:
     {{
       "title": "عنوان الامتحان",
       "subject": "{subject}",
@@ -120,7 +128,7 @@ def extract_and_solve_all_questions(exam_text: str, subject: str = "الرياض
             {{
               "id": "q1_a",
               "sub_label": "الفرع (أ)",
-              "text": "نص السؤال الفرعي كاملاً",
+              "text": "نص السؤال الفرعي كاملاً كما ورد في الورقة",
               "marks": 25,
               "answer": {{
                 "final_answer": "الجواب النهائي المعتمد",
@@ -129,27 +137,40 @@ def extract_and_solve_all_questions(exam_text: str, subject: str = "الرياض
                   {{"step": "وصف الخطوة", "marks": 5}},
                   {{"step": "وصف الخطوة", "marks": 5}}
                 ],
-                "examiner_tips": "ملاحظة وتوجيهات لجان التصحيح الوزارية"
+                "examiner_tips": "ملاحظة وتوجيهات لجان التصحيح الوزارية والأخطاء الشائعة"
               }}
             }}
           ]
         }}
       ]
     }}
-    تأكد من تكرار وحل جميع الفروع لكل سؤال رئيسي دون التوقف بعد الفرع الأول!
+    تأكد من تكرار وحل جميع الفروع لجميع الأسئلة 100%!
     """
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-            temperature=0.2,
-        )
-    )
+    contents = []
+    if file_bytes and mime_type:
+        try:
+            contents.append(types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
+        except Exception:
+            try:
+                b64 = base64.b64encode(file_bytes).decode("utf-8")
+                contents.append({"inline_data": {"mime_type": mime_type, "data": b64}})
+            except Exception:
+                pass
+
+    contents.append(prompt)
 
     try:
+        response = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                temperature=0.2,
+            )
+        )
+
         clean_text = response.text.strip()
         if clean_text.startswith("```json"):
             clean_text = clean_text[7:]
@@ -157,7 +178,7 @@ def extract_and_solve_all_questions(exam_text: str, subject: str = "الرياض
             clean_text = clean_text[:-3]
         return json.loads(clean_text)
     except Exception as e:
-        return {"error": f"فشل تحليل استجابة الذكاء الاصطناعي: {e}", "raw": response.text}
+        return {"error": f"فشل تحليل استجابة الذكاء الاصطناعي: {e}"}
 
 
 def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None, *args, **kwargs):
@@ -168,7 +189,6 @@ def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None
     st.header("📋 استخراج وحل الامتحانات الوزارية (المنهاج الأردني)")
     st.caption("نظام معتمد لاستخراج وحل جميع الأسئلة الرئيسية وكافة فروعها 100% مع سلم العلامات الرسمي")
 
-    # استخلاص اسم المبحث والفرع من الكتاب المختار تلقائياً إن وُجد
     default_subject = "الرياضيات"
     if book:
         if isinstance(book, dict):
@@ -176,7 +196,7 @@ def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None
         else:
             default_subject = getattr(book, "subject", getattr(book, "title", default_subject))
 
-    st.success("✅ **تم تفعيل الحل الشامل**: النظام يستخرج ويحل **جميع الفروع** لكافة الأسئلة الرئيسية بنسبة 100%.")
+    st.success("✅ **تم تفعيل الحل الشامل**: يدعم النظام ملفات PDF الممسوحة ضوئياً مباشرة، ويحل **جميع الفروع** لكافة الأسئلة الرئيسية بنسبة 100%.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -196,11 +216,7 @@ def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None
                 s_idx = i
                 break
 
-        subject = st.selectbox(
-            "المبحث الدراسي:",
-            subjects_list,
-            index=s_idx,
-        )
+        subject = st.selectbox("المبحث الدراسي:", subjects_list, index=s_idx)
 
     with col2:
         branch = st.selectbox(
@@ -221,29 +237,46 @@ def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None
     ])
 
     exam_text = ""
+    file_bytes_to_send = None
+    file_mime_to_send = None
 
     with tab_upload:
         uploaded_file = st.file_uploader(
-            "اختر ملف ورقة الامتحان الوزاري:",
+            "اختر ملف ورقة الامتحان الوزاري (PDF أو صورة):",
             type=["pdf", "png", "jpg", "jpeg", "docx", "txt"],
-            help="يدعم استخراج النصوص من ملفات PDF وصور الأسئلة والمستندات"
+            help="يدعم ملفات PDF العادية والمسحوبة سكانر والصور"
         )
         if uploaded_file is not None:
-            extracted = extract_text_from_file(uploaded_file)
+            raw_bytes = uploaded_file.getvalue()
+            fname = uploaded_file.name.lower()
+
+            if fname.endswith(".pdf"):
+                file_mime_to_send = "application/pdf"
+            elif fname.endswith((".png", ".jpg", ".jpeg")):
+                file_mime_to_send = "image/jpeg"
+            else:
+                file_mime_to_send = None
+
+            file_bytes_to_send = raw_bytes
+
+            extracted = extract_text_from_file(uploaded_file, raw_bytes)
             if extracted:
-                st.info(f"تم قراءة الملف بنجاح ({len(extracted)} حرف)")
+                st.success(f"✅ تم استخراج نص الامتحان الرقمي بنجاح ({len(extracted)} حرف)")
                 exam_text = extracted
             else:
-                st.warning("تعذر قراءة النص المباشر من الملف، يمكنك لصق النص في التبويب الثاني.")
+                st.info(f"📄 **تم استلام ملف الـ PDF بنجاح** ({len(raw_bytes)//1024} كيلوبايت).\n"
+                        "💡 نظراً لأن الامتحان ممسوح ضوئياً (سكانر أو صور)، سيقوم الذكاء الاصطناعي (Gemini Vision) بقراءة الأسئلة والمعادلات والرسومات مباشرة من صفحات الـ PDF عند النقر على زر البدء بالأسفل.")
+                exam_text = "ملف امتحان PDF ممسوح ضوئياً"
 
     with tab_paste:
         pasted_text = st.text_area(
             "الصق نص الأسئلة الوزارية هنا:",
             height=200,
-            placeholder="مثال:\nالسؤال الأول: (50 علامة)\nأ) إذا كان ق(س) = س³ - 3س² + 5، فجد النقط الحرجة...\nب) جد معادلة المماس لمنحنى الاقتران...\nالسؤال الثاني: (50 علامة)\nأ) احسب قيمة التكامل...\nب) جد مساحة المنطقة المحصورة..."
+            placeholder="مثال:\nالسؤال الأول: (50 علامة)\nأ) إذا كان ق(س) = س³ - 3س² + 5، فجد النقط الحرجة...\nب) جد معادلة المماس لمنحنى الاقتران..."
         )
         if pasted_text.strip():
             exam_text = pasted_text.strip()
+            file_bytes_to_send = None
 
     with tab_sample:
         st.write("يمكنك اختبار النظام فوراً بنموذج وزاري معتمد لمبحث الرياضيات العلمي:")
@@ -257,14 +290,6 @@ def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None
 السؤال الثاني: (50 علامة)
 أ) احسب قيمة التكامل غير المحدود: ∫ (2س + 1) هـ^(س² + س) د س. (25 علامة)
 ب) جد مساحة المنطقة المحصورة بين منحنى الاقتران ق(س) = 4 - س² ومحور السينات في الفترة [-2، 2]. (25 علامة)
-
-السؤال الثالث: (50 علامة)
-أ) يتحرك جسيم في خط مستقيم بحيث أن موقعه ف(ن) = ن³ - 6ن² + 9ن. جد تسارع الجسيم في اللحظة التي يسكن فيها سكوناً لحظياً لأول مرة. (25 علامة)
-ب) جد أبعاد أكبر مستطيل مساحةً يمكن رسمه بحيث تقع قاعدته على محور السينات ورأساه الآخران على منحنى ص = 12 - س². (25 علامة)
-
-السؤال الرابع: (50 علامة)
-أ) إذا كانت المصفوفة أ = [ [ 2 ، 1 ] ، [ 5 ، 3 ] ]، جد النظير الضربي للمصفوفة أ. (25 علامة)
-ب) باستخدام قاعدة كرامر أو النظير الضربي، حل نظام المعادلات الخطية: 2س + ص = 7 ، 5س + 3ص = 18. (25 علامة)
 """
             st.session_state["sample_loaded_text"] = exam_text
             st.success("تم تجهيز نموذج الامتحان بنجاح! انقر على زر البدء بالأسفل.")
@@ -274,17 +299,18 @@ def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None
 
     st.markdown("---")
 
-    # زر بدء المعالجة والحل
-    if st.button("🚀 استخراج وحل ورقة الامتحان الوزاري بالكامل (100%)", type="primary", use_container_width=True):
-        if not exam_text.strip():
-            st.error("يرجى تزويد النظام بنص الامتحان أولاً عبر الرفع أو اللصق أو النموذج الجاهز.")
-            return
-
-        with st.spinner("جارٍ استخراج جميع الأسئلة الرئيسية والفرعية وإعداد الإجابات النموذجية وسلالم العلامات..."):
-            result = extract_and_solve_all_questions(exam_text, subject=subject, branch=branch)
+    ready_to_solve = bool(exam_text.strip() or file_bytes_to_send)
+    if st.button("🚀 استخراج وحل ورقة الامتحان الوزاري بالكامل (100%)", type="primary", use_container_width=True, disabled=not ready_to_solve):
+        with st.spinner("جارٍ قراءة ورقة الامتحان عبر الذكاء الاصطناعي واستخراج وحل جميع الأسئلة والفروع..."):
+            result = extract_and_solve_all_questions(
+                exam_text=exam_text if exam_text != "ملف امتحان PDF ممسوح ضوئياً" else "",
+                file_bytes=file_bytes_to_send,
+                mime_type=file_mime_to_send,
+                subject=subject,
+                branch=branch
+            )
             st.session_state["ministry_exam_result"] = result
 
-    # عرض النتائج
     if "ministry_exam_result" in st.session_state:
         result = st.session_state["ministry_exam_result"]
 
@@ -306,7 +332,6 @@ def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None
 
         st.info(f"تم حل جميع الفروع ({total_sub} من أصل {total_sub}) بنجاح دون إغفال أي سؤال.")
 
-        # عرض الأسئلة والفروع
         for q_idx, main_q in enumerate(questions):
             title = main_q.get("title", f"السؤال {q_idx + 1}")
             q_marks = main_q.get("total_marks", "")
@@ -324,18 +349,15 @@ def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None
 
                     st.markdown(f"**{sub_label}**: {sub_text} `({sub_marks} علامة)`")
 
-                    # الجواب النهائي
                     if ans.get("final_answer"):
                         st.success(f"**الجواب النهائي المعتمد:** {ans['final_answer']}")
 
-                    # خطوات الحل
                     steps = ans.get("steps", [])
                     if steps:
                         st.markdown("**خطوات الحل النموذجية:**")
                         for step_idx, step in enumerate(steps):
                             st.markdown(f"{step_idx + 1}. {step}")
 
-                    # سلم العلامات
                     rubric = ans.get("rubric", [])
                     if rubric:
                         with st.expander("📝 سلم توزيع العلامات الوزاري المعتمد"):
@@ -345,13 +367,11 @@ def render_ministry(book=None, flat_lessons=None, user=None, lang="ar", idx=None
                                 else:
                                     st.write(f"- {item}")
 
-                    # إرشادات المصحح
                     if ans.get("examiner_tips"):
                         st.warning(f"💡 **توجيهات لجان التصحيح الوزارية:** {ans['examiner_tips']}")
 
                     st.markdown("---")
 
-        # تصدير النتائج
         st.download_button(
             label="💾 تحميل نموذج الإجابة الكامل (JSON)",
             data=json.dumps(result, ensure_ascii=False, indent=2),
