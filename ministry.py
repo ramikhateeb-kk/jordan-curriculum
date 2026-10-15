@@ -440,16 +440,64 @@ def extract(client, text, image):
 
 
 ANSWER_SYSTEM = (
-    "أنت معلم خبير تجيب عن أسئلة امتحان وزاري سابق بدقة، وتُراجَع إجاباتك من معلم قبل اعتمادها. التزم بما يلي:\n"
-    "1) للسؤال الذي له passage_key أجب اعتمادًا على النص المرفق له في passages فقط.\n"
-    "2) mcq: أعد correct_index (رقم الخيار الصحيح بدءًا من 0). tf: أعد correct (true أو false). "
-    "fill وshort: أعد answer إجابة مختصرة صحيحة بلغة السؤال (للفراغ: الكلمة أو العبارة الناقصة فقط).\n"
-    "3) الكلمات بين [[ ]] هي الكلمات المسطَّرة في الأصل وعليها مدار السؤال أحيانًا.\n"
-    "4) إن لم تكن متأكدًا فاجعل الإجابة null وconfidence = low. لا تخمّن ولا تخترع.\n"
-    "5) confidence: high أو medium أو low. note: سبب الإجابة في جملة موجزة بلغة السؤال.\n"
-    "أعد JSON فقط."
+    "You are an expert teacher answering past Ministry exam questions. A human reviewer will check your answers before "
+    "they are approved. Rules:\n"
+    "1) LANGUAGE: every item has an \"answer_language\" field. Write \"note\" and any free-text \"answer\" in that language "
+    "(English questions -> English; Arabic questions -> Arabic). Never answer an English question in Arabic.\n"
+    "2) For an item with a passage_key, answer from the matching text in \"passages\" only.\n"
+    "3) type mcq: you MUST choose exactly one of the given options. Return correct_index (0-based position in options) AND "
+    "correct_option_text (copy the chosen option exactly as written). Never leave an mcq without a chosen option unless you "
+    "truly cannot decide.\n"
+    "4) type tf: return correct (true or false). Types fill and short: return answer, a brief correct answer "
+    "(for fill: only the missing word or phrase).\n"
+    "5) Text inside [[ ]] was underlined in the original exam and is often what the question is about.\n"
+    "6) If you are not sure, set the answer fields to null and confidence to \"low\". Do not guess or invent.\n"
+    "7) confidence is high, medium or low. note is one short sentence explaining why.\n"
+    "Return JSON only."
 )
 ANSWER_TYPES = ("mcq", "tf", "fill", "short")
+
+
+def _lang_name(*texts):
+    """لغة السؤال (للتعليمات): Arabic إن غلبت الحروف العربية وإلا English."""
+    t = " ".join(str(x) for x in texts if x)
+    ar = len(re.findall(r"[\u0600-\u06FF]", t))
+    la = len(re.findall(r"[A-Za-z]", t))
+    return "Arabic" if ar > la else "English"
+
+
+def _pick_option(v, options):
+    """يحدد رقم الخيار الصحيح من ردّ النموذج بأكثر من طريقة: نص الخيار، ثم الحرف، ثم الرقم.
+    يعيد (index أو None, تضارب?)."""
+    n = len(options)
+    by_text = None
+    txt = v.get("correct_option_text") or (v.get("answer") if isinstance(v.get("answer"), str) else None)
+    if txt:
+        t = _n(txt)
+        for i, o in enumerate(options):
+            if _n(o) == t:
+                by_text = i
+                break
+        if by_text is None:
+            for i, o in enumerate(options):          # احتواء جزئي كملاذ أخير
+                if t and (t in _n(o) or _n(o) in t) and len(_n(o)) > 1:
+                    by_text = i
+                    break
+    by_letter = None
+    letter = v.get("correct_letter") or v.get("letter")
+    if isinstance(letter, str) and letter.strip():
+        L = letter.strip().strip(").").upper()
+        pos = ("ABCDE".find(L) if L in "ABCDE" else "أبجدهـ".find(letter.strip()[0]))
+        by_letter = pos if 0 <= pos < n else None
+    by_int = None
+    ci = v.get("correct_index")
+    if isinstance(ci, str) and ci.strip().isdigit():
+        ci = int(ci.strip())
+    if isinstance(ci, int) and not isinstance(ci, bool) and 0 <= ci < n:
+        by_int = ci
+    chosen = by_text if by_text is not None else (by_letter if by_letter is not None else by_int)
+    conflict = by_text is not None and by_int is not None and by_text != by_int
+    return chosen, conflict
 
 
 def suggest_answers(client, rows):
@@ -465,25 +513,29 @@ def suggest_answers(client, rows):
             if d.get("passage"):
                 pk = d.get("passage_key") or f"p{r['id']}"
                 passages[pk] = d["passage"]
-            items.append({"id": r["id"], "type": r["qtype"], "instruction": d.get("instruction"), "passage_key": pk,
-                          "question": d["question"], "options": d.get("options")})
-        prompt = (f"النصوص المشتركة:\n{json.dumps(passages, ensure_ascii=False)}\n\n"
-                  f"الأسئلة:\n{json.dumps(items, ensure_ascii=False)}\n\n"
-                  'أعد JSON: [{"id":12,"correct_index":null,"correct":null,"answer":null,"confidence":"high","note":"..."}]')
+            items.append({"id": r["id"], "type": r["qtype"], "answer_language": _lang_name(d["question"], d.get("passage")),
+                          "instruction": d.get("instruction"), "passage_key": pk, "question": d["question"],
+                          "options": d.get("options")})
+        prompt = (f"passages:\n{json.dumps(passages, ensure_ascii=False)}\n\n"
+                  f"items:\n{json.dumps(items, ensure_ascii=False)}\n\n"
+                  'Return a JSON list, one object per item: [{"id":12,"correct_index":1,"correct_option_text":"exact option text",'
+                  '"correct":null,"answer":null,"confidence":"high","note":"one short sentence"}]')
         data = _ask_json(client, ANSWER_SYSTEM, prompt)
         by_id = {r["id"]: r for r in chunk}
         for v in (data if isinstance(data, list) else []):
             r = by_id.get(v.get("id")) if isinstance(v, dict) else None
             if not r:
                 continue
-            res = {"ai_answer": True, "ai_conf": v.get("confidence") if v.get("confidence") in ("high", "medium", "low") else "low",
-                   "ai_note": str(v.get("note") or "").strip()[:300] or None}
+            conf = v.get("confidence") if v.get("confidence") in ("high", "medium", "low") else "low"
+            res = {"ai_answer": True, "ai_conf": conf, "ai_note": str(v.get("note") or "").strip()[:300] or None}
             qt = r["qtype"]
             if qt == "mcq":
-                ci, n = v.get("correct_index"), len(r["data"].get("options") or [])
-                if not (isinstance(ci, int) and not isinstance(ci, bool) and 0 <= ci < n):
+                idx, conflict = _pick_option(v, r["data"].get("options") or [])
+                if idx is None:
                     continue
-                res["correct_index"] = ci
+                if conflict:                      # نص الخيار لا يطابق رقمه: نثق بالنص ونخفض الثقة
+                    res["ai_conf"] = "low"
+                res["correct_index"] = idx
             elif qt == "tf":
                 if not isinstance(v.get("correct"), bool):
                     continue
@@ -607,7 +659,7 @@ def style_snippet(book_slug, qtype, lang="ar", k=3):
 
 
 def _n(t):
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]|_", " ", _norm(str(t)))).strip()
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]|_", " ", _norm(str(t)).lower())).strip()
 
 
 def too_similar(book_slug, text):
@@ -876,7 +928,10 @@ def _review_section(book, flat_lessons, user, lang):
             if q["qtype"] in ANSWER_TYPES:
                 if d.get("ai_answer"):
                     conf = {"high": "عالية", "medium": "متوسطة", "low": "منخفضة"}.get(d.get("ai_conf"), "")
-                    st.warning(f"🤖 الإجابة أعلاه مقترحة من الذكاء الاصطناعي (الثقة: {conf})"
+                    pick_txt = ""
+                    if q["qtype"] == "mcq" and d.get("correct_index") is not None and d["correct_index"] < len(d.get("options") or []):
+                        pick_txt = f"الخيار المقترح: **{letters[d['correct_index']]}) {d['options'][d['correct_index']]}** — "
+                    st.warning(f"🤖 {pick_txt}إجابة مقترحة من الذكاء الاصطناعي (الثقة: {conf})"
                                + (f" — {d['ai_note']}" if d.get("ai_note") else "") + ". راجعها وعدّلها إن لزم قبل الاعتماد.")
                 if st.button("🤖 اقتراح الإجابة لهذا السؤال", key=f"{k}_ai"):
                     now_row = {"id": q["id"], "qtype": q["qtype"],
