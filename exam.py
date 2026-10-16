@@ -354,6 +354,30 @@ def _set_cell_margins(cell, top=0, start=0, bottom=0, end=0):
 # بناء ملف Word
 # ----------------------------------------------------------------
 
+def _attach_reading_texts(sel, idx, flat_lessons):
+    """أسئلة القراءة الوزارية النمط: يُطبع نص الدرس كاملًا (من فهرس الكتاب) مرة واحدة قبل أول سؤال عليه،
+    وتُجمع الأسئلة التي على النص نفسه متجاورة."""
+    import subject_profiles as sp
+    by_title = {l["title"]: l for l in flat_lessons}
+    texts, out = {}, {}
+    for qtype, items in sel.items():
+        enriched = []
+        for q in items:
+            lt, lesson = q.get("ref_lesson"), by_title.get(q.get("ref_lesson"))
+            if lt and lesson:
+                if lt not in texts:
+                    texts[lt] = sp.full_reading_text(idx, lesson)
+                if texts[lt]:
+                    q = {**q, "passage": texts[lt], "passage_key": f"ref-{lt}"}
+            enriched.append(q)
+        first = {}
+        for i, q in enumerate(enriched):
+            first.setdefault(q.get("passage_key") or f"_{i}", i)
+        order = sorted(range(len(enriched)), key=lambda i: (first[enriched[i].get("passage_key") or f"_{i}"], i))
+        out[qtype] = [enriched[i] for i in order]
+    return out
+
+
 def _strip_marks(sel):
     """يزيل علامات [[ ]] (الكلمات المسطَّرة) من نصوص الأسئلة في الورقة العربية."""
     import re
@@ -731,7 +755,7 @@ def build_docx(header, selected_by_type, marks, logo_bytes):
         for local_n, qtype, q in entries:
 
             page = (
-                f" (صفحة {q['page']})"
+                f" (صفحة {q.get('page_printed') or q['page']})"
                 if q.get("page")
                 else ""
             )
@@ -849,6 +873,7 @@ def render_exam_builder(idx, slug, subject, sem, flat_lessons, ctx=None, user=No
         header = {"liwa": liwa.strip(), "school": school.strip(), "subject": subject, "kind": kind,
                   "semester_label": "الأول" if sem == 1 else "الثاني", "duration": duration,
                   "year": year.strip(), "date": exam_date.strftime("%Y/%m/%d"), "teacher": teacher.strip()}
+        selected_by_type = _attach_reading_texts(selected_by_type, idx, flat_lessons)
         _marks = {k: v for k, v in exam["marks"].items() if exam["counts"][k]}
         _lang = flat_lessons[0].get("lang", "ar") if flat_lessons else "ar"
         if _lang == "en":   # مبحث إنجليزي: ورقة الاختبار بالإنجليزية واتجاه الصفحة من اليسار إلى اليمين

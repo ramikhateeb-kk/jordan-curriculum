@@ -25,6 +25,7 @@ def attach(books, book, flat_lessons, lang):
     يعيد الكتاب المرافق أو None. لا يرفع استثناءً: أي فشل في تجهيز المرافق يعني ببساطة عدم وجوده."""
     for l in flat_lessons:
         l["lang"] = lang
+        l["page_offset"] = book.get("page_offset", 0) or 0     # لتحويل صفحة ملف PDF إلى الصفحة المطبوعة في الكتاب
     comps = [b for b in books if b.get("parent_slug") == book["slug"]]
     if not comps:
         return None

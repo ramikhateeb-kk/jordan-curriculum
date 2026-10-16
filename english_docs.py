@@ -497,6 +497,6 @@ def build_exam_docx(header, selected_by_type, marks, logo_bytes, load_image=None
         doc.add_paragraph()
         _para(doc.add_paragraph(), f"Question {ordinal} ({label}):", 12, True)
         for n, q in entries:
-            page = f" (page {q['page']})" if q.get("page") else ""
+            page = f" (page {q.get('page_printed') or q['page']})" if q.get("page") else ""
             _para(doc.add_paragraph(), f"{n}. {_correct_en(q)}{page}", 12)
     return _doc_bytes(doc)
