@@ -16,6 +16,7 @@ import re as _re
 
 import companion
 import images
+import rag
 import ministry
 import qbank
 import reading_texts
@@ -162,37 +163,56 @@ def _generate_passage(client, idx, slug, lesson, qtype, asked_texts, passage, st
     return None
 
 
-def _generate_reference(client, idx, slug, lesson, qtype, asked_texts, style):
-    """درس قراءة/Culture/Literature (إنجليزي): سؤال يُشير إلى النص باسمه ورقم صفحته المطبوعة دون عرض النص.
-    يتحقق النظام أن كل اقتباس في السؤال موجود فعلًا في الكتاب وأن الصفحة المذكورة من صفحات الدرس."""
+def _generate_reference(client, idx, slug, lesson, qtype, asked_texts, style, lang="en"):
+    """درس قراءة (إنجليزي/عربي): سؤال محايد يشير إلى النص دون ذكر عنوانه أو صفحته (يُضيفهما النظام)، ويُحفظ مرجعه منفصلًا.
+    المصدر: النص المحفوظ للدرس (المستخرج أو المُدخَل يدويًا) مع صفحات الكتاب للتحقق من الصفحة والاقتباسات."""
     off = int(lesson.get("page_offset") or 0)
     pages = select_context(idx, lesson["title"], (lesson["start"], lesson["end"]), max_chars=CONTEXT_BUDGET)
-    if not pages:
-        return None
-    ctx_text = "\n\n".join(f"=== Student's Book page {p['page'] - off} ===\n{sp.fix_ligatures(p['text'])}" for p in pages)
-    if len(sp.fix_ligatures(" ".join(p["text"] for p in pages)).split()) < 60:
+    row = reading_texts.get_text(slug, lesson, idx)                 # النص المنظَّف وتمارينه (يُستخرج مرة واحدة أو يدويًا)
+    clean = ((row or {}).get("text") or "").strip()
+    raw_words = len(sp.fix_ligatures(" ".join(p["text"] for p in pages)).split())
+    if not clean and raw_words < 60:
         return None                                    # لا يوجد نص كافٍ في الدرس
+    blocks = []
+    if clean:
+        blocks.append("READING TEXT (as printed in the book):\n" + clean)
+    if pages:
+        blocks.append("BOOK PAGES (with PRINTED page numbers):\n" + "\n\n".join(
+            f"=== page {p['page'] - off} ===\n{sp.fix_ligatures(p['text'])}" for p in pages))
     schema = SPECS[qtype][1].replace('"page":12}', '"page":6,"quotes":[]}')
-    asked = "\n".join(f"- {a}" for a in asked_texts) or "none"
-    _row = reading_texts.get_text(slug, lesson, idx)               # نص الدرس المنظَّف وتمارينه (يُستخرج مرة واحدة)
-    prompt = sp.reference_prompt(lesson, ctx_text, qtype, asked, schema, style, (_row or {}).get("exercises") or "")
+    asked = "\n".join(f"- {a}" for a in asked_texts) or ("none" if lang == "en" else "لا يوجد")
+    exercises = (row or {}).get("exercises") or ""
+    if lang == "ar":
+        system, prompt = sp.SYSTEM_REFERENCE_AR, sp.reference_prompt_ar(lesson, "\n\n".join(blocks), qtype, asked, schema,
+                                                                       style, exercises)
+    else:
+        system, prompt = sp.SYSTEM_REFERENCE_EN, sp.reference_prompt(lesson, "\n\n".join(blocks), qtype, asked, schema,
+                                                                      style, exercises)
     valid_printed = {p["page"] - off for p in pages}
-    corpus = " ".join(p["text"] for p in pages)
+    corpus = clean + " " + " ".join(p["text"] for p in pages)
     for _ in range(2):
-        q = _json(client, sp.SYSTEM_REFERENCE_EN, prompt)
+        q = _json(client, system, prompt)
         if not isinstance(q, dict):
             continue
         try:
             printed = int(q.get("page"))
         except (TypeError, ValueError):
+            printed = None
+        if printed is not None and printed not in valid_printed:
+            printed = None                             # صفحة غير موجودة: نتجاهلها إن كان النص المحفوظ يكفي
+        if printed is None and not clean:
             continue
-        if printed not in valid_printed or not sp.quotes_ok(q.pop("quotes", None), corpus):
-            continue                                   # صفحة غير موجودة أو اقتباس غير حرفي: نرفض ونعيد
-        if re.search(r"\bpages?\s*\d+", str(q.get("question", "")), re.I):
+        if not sp.quotes_ok(q.pop("quotes", None), corpus):
+            continue                                   # اقتباس غير حرفي: نرفض ونعيد
+        if re.search(r"(\bpages?\s*\d+|صفحة\s*\d+)", str(q.get("question", "")), re.I):
             continue                                   # النظام هو من يضيف الصفحة؛ لا تُكتب داخل السؤال
-        q["ref_title"], q["ref_page"], q["ref_lesson"] = sp.text_title(lesson["title"]), printed, lesson["title"]
-        q["page"] = printed + off                      # داخليًا بترقيم ملف الكتاب كبقية الأسئلة
-        if _valid(q, qtype, pages) and not ministry.too_similar(slug, str(q.get("question", ""))):
+        q["page"] = (printed + off) if printed is not None else None
+        ctx_ok = pages if printed is not None else [{"page": None, "text": ""}]
+        if q["page"] is None:
+            q.pop("page")
+        if _valid(q, qtype, ctx_ok) and not ministry.too_similar(slug, str(q.get("question", ""))):
+            q["ref_title"] = (row or {}).get("title") or sp.text_title(lesson["title"])
+            q["ref_page"], q["ref_lesson"], q["ref_lang"] = printed, lesson["title"], lang
             _finalize(q, qtype, lesson)
             return q, _save(slug, lesson, qtype, q)
     return None
@@ -208,9 +228,10 @@ def _generate(client, idx, slug, lesson, qtype, asked_texts, passage=None):
         return None, None
     style = ministry.style_snippet(slug, qtype, lang)              # نمط الأسئلة الوزارية (إن وُجد)
     kind = sp.lesson_kind(lesson["title"]) if lang == "en" else None
-    if kind in sp.PASSAGE_KINDS:                                   # قراءة/Culture/Literature
-        if sp.READING_MODE == "reference":                         # سؤال يشير إلى النص باسمه وصفحته (الافتراضي)
-            res = _generate_reference(client, idx, slug, lesson, qtype, asked_texts, style)
+    stored = reading_texts._row(slug, lesson["title"])             # نص قراءة محفوظ لهذا الدرس (آليًا أو يدويًا، أي لغة)
+    if kind in sp.PASSAGE_KINDS or (stored and stored.get("text")):
+        if sp.READING_MODE == "reference" or lang != "en":         # سؤال يشير إلى النص (الافتراضي)
+            res = _generate_reference(client, idx, slug, lesson, qtype, asked_texts, style, lang)
         else:                                                      # عرض قطعة حرفية ثم سؤال عليها
             res = _generate_passage(client, idx, slug, lesson, qtype, asked_texts, passage, style)
         if res is not None:
@@ -399,7 +420,10 @@ def render_quiz(idx, slug, lessons):
         with st.spinner("جارٍ إعداد السؤال..."):
             quiz["cur"] = next_question(client, idx, slug, lessons, quiz)
         if quiz["cur"] is None:
-            st.error("تعذّر إعداد سؤال موثّق من نص الدرس. حاول مرة أخرى.")
+            if rag.recent_quota_error():
+                st.error("تم تجاوز الحد المسموح لاستخدام الذكاء الاصطناعي مؤقتًا في كل النماذج المتاحة. حاول بعد دقيقة.")
+            else:
+                st.error("تعذّر إعداد سؤال موثّق من نص الدرس. حاول مرة أخرى.")
             if st.button("إعادة المحاولة"):
                 st.rerun()
             return
@@ -409,12 +433,15 @@ def render_quiz(idx, slug, lessons):
     st.progress(quiz["i"] / quiz["n"])
     st.markdown(f"**السؤال {quiz['i'] + 1} من {quiz['n']}** — {q.get('_lesson', '')}")
     if q.get("ref_title"):                         # سؤال على نص قراءة: يُذكر اسمه وصفحته، والنص الكامل عند الطلب
-        st.caption(f'📖 From your reading of "{q["ref_title"]}"' + (f" (page {q['ref_page']})" if q.get("ref_page") else ""))
+        if q.get("ref_lang") == "ar":
+            st.caption(f'📖 من خلال قراءتك لنص «{q["ref_title"]}»' + (f" (صفحة {q['ref_page']})" if q.get("ref_page") else ""))
+        else:
+            st.caption(f'📖 From your reading of "{q["ref_title"]}"' + (f" (page {q['ref_page']})" if q.get("ref_page") else ""))
         _ref = next((l for l in lessons if l["title"] == q.get("ref_lesson")), None)
         _row = reading_texts.get_text(slug, _ref, idx) if _ref else None
         if _row and _row.get("text"):
             with st.expander("📄 عرض النص"):
-                reading_texts.show(_row, "en")
+                reading_texts.show(_row, q.get("ref_lang") or "en")
     if q.get("passage"):
         with st.container(border=True):
             _md_u(q["passage"])

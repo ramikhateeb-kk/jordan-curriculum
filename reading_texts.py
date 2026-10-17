@@ -47,6 +47,35 @@ def _row(book_slug, lesson_title):
     return _local().get(f"{book_slug}|{lesson_title}")
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def list_rows(book_slug):
+    """كل نصوص كتاب في طلب واحد: {عنوان الدرس: {title, source, words}} (لعرض الحالة دون استعلام لكل درس)."""
+    if _sb_on():
+        url, h = catalog._sb()
+        r = requests.get(f"{url}/rest/v1/reading_texts", headers=h, timeout=TIMEOUT,
+                         params={"select": "lesson_title,title,text,source", "book_slug": f"eq.{book_slug}"})
+        catalog._check(r)
+        rows = {x["lesson_title"]: x for x in r.json()}
+    else:
+        rows = {k.split("|", 1)[1]: v for k, v in _local().items() if k.startswith(f"{book_slug}|")}
+    return {t: {"title": v.get("title"), "source": v.get("source"), "words": len(str(v.get("text") or "").split())}
+            for t, v in rows.items()}
+
+
+def delete_row(book_slug, lesson_title):
+    if _sb_on():
+        url, h = catalog._sb()
+        r = requests.delete(f"{url}/rest/v1/reading_texts", headers=h, timeout=TIMEOUT,
+                            params={"book_slug": f"eq.{book_slug}", "lesson_title": f"eq.{lesson_title}"})
+        catalog._check(r)
+    else:
+        db = _local()
+        db.pop(f"{book_slug}|{lesson_title}", None)
+        LOCAL_FILE.write_text(json.dumps(db, ensure_ascii=False), encoding="utf-8")
+    _row.clear()
+    list_rows.clear()
+
+
 def save_row(book_slug, lesson_title, title, text, exercises, source, user_id=None):
     row = {"book_slug": book_slug, "lesson_title": lesson_title, "title": title or None, "text": text,
            "exercises": (exercises or "")[:EXERCISES_MAX] or None, "source": source, "updated_by": user_id,
@@ -63,6 +92,7 @@ def save_row(book_slug, lesson_title, title, text, exercises, source, user_id=No
         LOCAL_FILE.parent.mkdir(parents=True, exist_ok=True)
         LOCAL_FILE.write_text(json.dumps(db, ensure_ascii=False), encoding="utf-8")
     _row.clear()
+    list_rows.clear()
 
 
 # ---------------------------------------------------------------- الاستخراج بالذكاء الاصطناعي

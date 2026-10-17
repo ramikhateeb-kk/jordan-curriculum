@@ -118,6 +118,11 @@ user = auth_ui.require_login()
 role = user["role"]   # "student" | "teacher" | "supervisor" | "admin"
 
 if role == "admin":
+    with st.sidebar.expander("🤖 حالة نماذج الذكاء الاصطناعي"):
+        import rag as _rag
+        for _m, _st in _rag.model_status():
+            st.write(f"{_m}: {_st}")
+        st.caption(f"آخر نموذج أجاب: {_rag.LAST_USED[0] or '—'} — يُضاف نموذج بديل بمتغير GEMINI_FALLBACK_MODELS.")
     admin_view = st.sidebar.radio("عرض المدير", ["📚 استخدام المنصة", "👑 إدارة الحسابات"])
     if admin_view == "👑 إدارة الحسابات":
         auth_ui.render_admin_accounts_panel(user)

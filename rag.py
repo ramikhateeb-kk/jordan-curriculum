@@ -9,6 +9,8 @@ import json
 import math
 import os
 import re
+import threading
+import time
 import unicodedata
 from collections import Counter
 from functools import lru_cache
@@ -31,6 +33,107 @@ SYSTEM = (
 )
 
 
+# ------------------------------------------------------------ الانتقال التلقائي بين نماذج Gemini
+# عند تجاوز الحد المسموح (429) أو انشغال الخدمة (503) أو عدم وجود النموذج (404) يُجرَّب النموذج التالي في السلسلة تلقائيًا.
+# السلسلة: GEMINI_MODEL ثم GEMINI_FALLBACK_MODELS (أسماء مفصولة بفواصل في متغير بيئة أو في secrets). لكل نموذج حصة مستقلة غالبًا.
+_DEFAULT_FALLBACKS = "gemini-2.5-flash-lite,gemini-2.0-flash"
+_COOL = {}                       # نموذج -> وقت انتهاء فترة الراحة
+_LOCK = threading.Lock()
+LAST_QUOTA = [0.0]               # آخر مرة فشلت فيها كل النماذج بسبب الحد المسموح
+LAST_USED = [None]
+
+
+def _fallbacks():
+    raw = os.getenv("GEMINI_FALLBACK_MODELS")
+    if raw is None:
+        try:
+            import streamlit as st
+            raw = st.secrets.get("GEMINI_FALLBACK_MODELS")
+        except Exception:
+            raw = None
+    return [m.strip() for m in (raw if raw is not None else _DEFAULT_FALLBACKS).split(",") if m.strip()]
+
+
+def model_chain(primary=None):
+    """النماذج بترتيب التجربة: ما ليس في فترة راحة أولًا، ثم الباقي حسب أقرب انتهاء للراحة (فلا نتوقف إن كانت كلها مرهقة)."""
+    chain = list(dict.fromkeys([primary or GEMINI_MODEL] + _fallbacks()))
+    now = time.time()
+    with _LOCK:
+        ready = [m for m in chain if _COOL.get(m, 0) <= now]
+        cooling = sorted((m for m in chain if m not in ready), key=lambda m: _COOL[m])
+    return ready + cooling
+
+
+def model_status():
+    """[(نموذج, 'جاهز' أو 'راحة N ث')] للتشخيص."""
+    now = time.time()
+    return [(m, "جاهز" if _COOL.get(m, 0) <= now else f"راحة {int(_COOL[m] - now)} ث") for m in model_chain()]
+
+
+def _classify(e):
+    code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    msg = str(e)
+    low = msg.lower()
+    if code in (401, 403) or "api key not valid" in low or "permission_denied" in low:
+        return "fatal"
+    if code == 429 or "resource_exhausted" in low or "quota" in low or "rate limit" in low:
+        return "quota"
+    if code in (500, 502, 503, 504) or "unavailable" in low or "overloaded" in low or "deadline" in low:
+        return "busy"
+    if code == 404 or "not found" in low or "not supported" in low:
+        return "missing"
+    return "other"
+
+
+def _cool(model, kind, e):
+    low = str(e).lower()
+    secs = {"quota": 3600 if ("perday" in low or "per day" in low or "daily" in low) else 60,
+            "busy": 30, "missing": 3600, "other": 10}[kind]
+    with _LOCK:
+        _COOL[model] = time.time() + secs
+
+
+class _Models:
+    def __init__(self, client):
+        self._c = client
+
+    def generate_content(self, *, model=None, **kw):
+        last, kinds = None, []
+        for m in model_chain(model):
+            try:
+                r = self._c.models.generate_content(model=m, **kw)
+                LAST_USED[0] = m
+                return r
+            except Exception as e:  # noqa: BLE001
+                kind = _classify(e)
+                if kind == "fatal":
+                    raise
+                print(f"Gemini: النموذج {m} فشل ({kind}): {str(e)[:160]} — الانتقال إلى النموذج التالي")
+                _cool(m, kind, e)
+                last = e
+                kinds.append(kind)
+        if kinds and all(k == "quota" for k in kinds):
+            LAST_QUOTA[0] = time.time()
+        raise last
+
+    def __getattr__(self, name):
+        return getattr(self._c.models, name)
+
+
+class _Client:
+    """غلاف حول genai.Client يحتفظ به حيًّا (إغلاقه يقطع الطلبات) ويضيف الانتقال التلقائي بين النماذج."""
+    def __init__(self, client):
+        self._c = client
+        self.models = _Models(client)
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
+def recent_quota_error(seconds=180):
+    return time.time() - LAST_QUOTA[0] < seconds
+
+
 def get_client():
     key = os.getenv("GEMINI_API_KEY")
     if not key:
@@ -41,7 +144,7 @@ def get_client():
             pass
     if not key:
         raise RuntimeError("لم يتم العثور على GEMINI_API_KEY")
-    return genai.Client(api_key=key)
+    return _Client(genai.Client(api_key=key))
 
 
 # ------------------------------------------------------------ البحث المحلي (BM25) — للنطاقات الكبيرة فقط
