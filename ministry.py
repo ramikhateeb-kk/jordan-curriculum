@@ -29,6 +29,8 @@ import auth_ui
 import catalog
 import images
 import qbank
+import reading_texts
+import subject_profiles as sp
 from config import BASE, GEMINI_MODEL
 from rag import _norm, get_client, select_context
 
@@ -1208,6 +1210,49 @@ def _transfer_section(book, flat_lessons, user):
                 st.rerun()
 
 
+def _reading_section(book, flat_lessons, user, lang, idx):
+    slug = book["slug"]
+    st.caption("نص كل درس قراءة بتنسيق الكتاب (أسطره وفقراته)، يُعرض للطالب بزر «عرض النص» ويُطبع كاملًا في ورقة الاختبار قبل "
+               "أسئلته. يُستخرج مرة واحدة بالذكاء الاصطناعي ثم تراجعه وتعدّله هنا. باقي أسطر الصفحة (تمارين الكتاب) تُحفظ "
+               "وتُستعمل أفكارًا عند توليد الأسئلة.")
+    if idx is None:
+        st.warning("فهرس الكتاب غير متاح.")
+        return
+    lessons = [l for l in flat_lessons if sp.lesson_kind(l["title"]) in sp.PASSAGE_KINDS]
+    if not lessons:
+        st.info("لا توجد دروس قراءة في هذا الكتاب (Reading / Culture Spot / Literature Spot).")
+        return
+    for i, l in enumerate(lessons):
+        row = reading_texts._row(slug, l["title"])
+        status = ({"ai": "🤖 مستخرج آليًا — راجعه", "manual": "✅ معتمد"}.get(row.get("source"), "") if row
+                  else "— لم يُستخرج بعد —")
+        with st.expander(f"{l['title']} — {status}"):
+            k = f"rt_{slug}_{i}"
+            if row and row.get("text"):
+                st.caption("معاينة كما سيظهر النص:")
+                with st.container(border=True):
+                    reading_texts.show(row, lang)
+            if st.button("🤖 استخراج / إعادة الاستخراج بالذكاء الاصطناعي", key=f"{k}_ai"):
+                auth_ui.require_quota_or_stop(user)
+                with st.spinner("جارٍ استخراج النص..."):
+                    got = reading_texts.extract_with_ai(get_client(), idx, l)
+                if got:
+                    reading_texts.save_row(slug, l["title"], got[0], got[1], got[2], "ai", user["id"])
+                    for suffix in ("ti", "t", "e"):
+                        st.session_state.pop(f"{k}_{suffix}", None)
+                    st.rerun()
+                else:
+                    st.error("لم يُعثر على نص قراءة في صفحات هذا الدرس. أدخله يدويًا أدناه.")
+            title = st.text_input("عنوان النص (إن طُبع)", (row or {}).get("title") or "", key=f"{k}_ti")
+            text = st.text_area("النص — سطر الكتاب = سطر، والفقرة تُفصل بسطر فارغ", (row or {}).get("text") or "",
+                                height=320, key=f"{k}_t")
+            ex = st.text_area("تمارين الدرس المطبوعة في الصفحات (للاستئناس عند التوليد)", (row or {}).get("exercises") or "",
+                              height=140, key=f"{k}_e")
+            if st.button("💾 حفظ واعتماد", key=f"{k}_s", type="primary", disabled=not text.strip()):
+                reading_texts.save_row(slug, l["title"], title.strip() or None, text.strip(), ex, "manual", user["id"])
+                st.rerun()
+
+
 def _style_section(book, user, lang):
     slug = book["slug"]
     approved = list_questions(slug, status="approved")
@@ -1251,7 +1296,8 @@ def render_ministry(book, flat_lessons, user, lang="ar", idx=None):
             return
         _bank_tab(book, user, False, lang)
         return
-    t1, t2, t4, t3 = st.tabs(["📚 البنك", "⬆️ رفع ومراجعة", "🏦 نقل إلى بنك قيّمني", "🎯 نمط الأسئلة"])
+    t1, t2, t4, t5, t3 = st.tabs(["📚 البنك", "⬆️ رفع ومراجعة", "🏦 نقل إلى بنك قيّمني", "📄 نصوص القراءة",
+                                  "🎯 نمط الأسئلة"])
     with t1:
         _bank_tab(book, user, True, lang)
     with t2:
@@ -1260,5 +1306,7 @@ def render_ministry(book, flat_lessons, user, lang="ar", idx=None):
         _review_section(book, flat_lessons, user, lang, idx)
     with t4:
         _transfer_section(book, flat_lessons, user)
+    with t5:
+        _reading_section(book, flat_lessons, user, lang, idx)
     with t3:
         _style_section(book, user, lang)

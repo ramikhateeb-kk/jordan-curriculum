@@ -18,6 +18,7 @@ import companion
 import images
 import ministry
 import qbank
+import reading_texts
 import subject_profiles as sp
 from config import GEMINI_MODEL
 from rag import get_client, select_context
@@ -173,7 +174,8 @@ def _generate_reference(client, idx, slug, lesson, qtype, asked_texts, style):
         return None                                    # لا يوجد نص كافٍ في الدرس
     schema = SPECS[qtype][1].replace('"page":12}', '"page":6,"quotes":[]}')
     asked = "\n".join(f"- {a}" for a in asked_texts) or "none"
-    prompt = sp.reference_prompt(lesson, ctx_text, qtype, asked, schema, style)
+    _row = reading_texts.get_text(slug, lesson, idx)               # نص الدرس المنظَّف وتمارينه (يُستخرج مرة واحدة)
+    prompt = sp.reference_prompt(lesson, ctx_text, qtype, asked, schema, style, (_row or {}).get("exercises") or "")
     valid_printed = {p["page"] - off for p in pages}
     corpus = " ".join(p["text"] for p in pages)
     for _ in range(2):
@@ -409,10 +411,10 @@ def render_quiz(idx, slug, lessons):
     if q.get("ref_title"):                         # سؤال على نص قراءة: يُذكر اسمه وصفحته، والنص الكامل عند الطلب
         st.caption(f'📖 From your reading of "{q["ref_title"]}"' + (f" (page {q['ref_page']})" if q.get("ref_page") else ""))
         _ref = next((l for l in lessons if l["title"] == q.get("ref_lesson")), None)
-        _full = sp.full_reading_text(idx, _ref) if _ref else ""
-        if _full:
+        _row = reading_texts.get_text(slug, _ref, idx) if _ref else None
+        if _row and _row.get("text"):
             with st.expander("📄 عرض النص"):
-                _md_u(_full)
+                reading_texts.show(_row, "en")
     if q.get("passage"):
         with st.container(border=True):
             _md_u(q["passage"])

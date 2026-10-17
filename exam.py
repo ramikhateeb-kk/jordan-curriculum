@@ -19,6 +19,7 @@ from docx.shared import Cm, Pt
 import english_docs
 import images
 import qbank
+import reading_texts
 from quiz import _generate, correct_text
 
 TYPE_LABELS = {"mcq": "اختيار من متعدد", "tf": "صح أو خطأ", "fill": "أكمل الفراغ", "short": "سؤال قصير"}
@@ -354,7 +355,7 @@ def _set_cell_margins(cell, top=0, start=0, bottom=0, end=0):
 # بناء ملف Word
 # ----------------------------------------------------------------
 
-def _attach_reading_texts(sel, idx, flat_lessons):
+def _attach_reading_texts(sel, idx, flat_lessons, slug):
     """أسئلة القراءة الوزارية النمط: يُطبع نص الدرس كاملًا (من فهرس الكتاب) مرة واحدة قبل أول سؤال عليه،
     وتُجمع الأسئلة التي على النص نفسه متجاورة."""
     import subject_profiles as sp
@@ -366,9 +367,11 @@ def _attach_reading_texts(sel, idx, flat_lessons):
             lt, lesson = q.get("ref_lesson"), by_title.get(q.get("ref_lesson"))
             if lt and lesson:
                 if lt not in texts:
-                    texts[lt] = sp.full_reading_text(idx, lesson)
-                if texts[lt]:
-                    q = {**q, "passage": texts[lt], "passage_key": f"ref-{lt}"}
+                    texts[lt] = reading_texts.get_text(slug, lesson, idx)
+                row = texts[lt]
+                if row and row.get("text"):
+                    q = {**q, "passage": row["text"], "passage_key": f"ref-{lt}",
+                         "passage_title": row.get("title") or q.get("ref_title")}
             enriched.append(q)
         first = {}
         for i, q in enumerate(enriched):
@@ -593,7 +596,11 @@ def build_docx(header, selected_by_type, marks, logo_bytes):
                 _pk = q.get("passage_key") or q["passage"][:40]
                 if _pk not in printed_passages:
                     printed_passages.add(_pk)
-                    _right(doc, q["passage"], 11)
+                    _right(doc, "اقرأ النص الآتي ثم أجب عن الأسئلة التي تليه:", 12, True)
+                    if q.get("passage_title"):
+                        _right(doc, q["passage_title"], 12, True)
+                    for _blk in str(q["passage"]).split("\n\n"):      # فقرات الكتاب وأسطره كما هي
+                        _right(doc, _blk, 11)
 
             # كل سؤال في خلية بعرض الصفحة كاملًا
             # لضمان وصول النص إلى أقصى اليمين.
@@ -873,7 +880,7 @@ def render_exam_builder(idx, slug, subject, sem, flat_lessons, ctx=None, user=No
         header = {"liwa": liwa.strip(), "school": school.strip(), "subject": subject, "kind": kind,
                   "semester_label": "الأول" if sem == 1 else "الثاني", "duration": duration,
                   "year": year.strip(), "date": exam_date.strftime("%Y/%m/%d"), "teacher": teacher.strip()}
-        selected_by_type = _attach_reading_texts(selected_by_type, idx, flat_lessons)
+        selected_by_type = _attach_reading_texts(selected_by_type, idx, flat_lessons, slug)
         _marks = {k: v for k, v in exam["marks"].items() if exam["counts"][k]}
         _lang = flat_lessons[0].get("lang", "ar") if flat_lessons else "ar"
         if _lang == "en":   # مبحث إنجليزي: ورقة الاختبار بالإنجليزية واتجاه الصفحة من اليسار إلى اليمين

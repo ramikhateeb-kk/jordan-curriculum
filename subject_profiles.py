@@ -279,10 +279,12 @@ def quotes_ok(quotes, corpus):
     return all(_squash(q) and _squash(q) in base for q in (quotes or []))
 
 
-def reference_prompt(lesson, ctx_text, qtype, asked, schema, style=""):
+def reference_prompt(lesson, ctx_text, qtype, asked, schema, style="", exercises=""):
     return (
         f"Reading text / lesson: \"{text_title(lesson['title'])}\" ({lesson['title']})\n\n"
         f"Book text with PRINTED page numbers (use these numbers in the question):\n{ctx_text}\n\n"
+        + (f"Exercises printed in the book on the same pages (use them for inspiration about question types and items; adapt "
+           f"them, do not copy them verbatim):\n{exercises[:3000]}\n\n" if exercises else "")
         + (f"{style}\n\n" if style else "")
         + f"Write ONE question of this kind: {qtype_desc(qtype)}.\n"
         f"Do not repeat questions already asked about this lesson:\n{asked}\n\n"
@@ -292,30 +294,149 @@ def reference_prompt(lesson, ctx_text, qtype, asked, schema, style=""):
 
 
 _FULL_CACHE = {}
+_LETTER_ITEM = re.compile(r"^[a-d]\s")
 
 
-def full_reading_text(idx, lesson, min_run_words=50):
-    """نص القراءة الكامل لدرس كما في الكتاب (حرفيًا): كل المقاطع النثرية المتصلة في صفحات الدرس بترتيبها، دون تمارين الكتاب.
-    يُجلب من فهرس الكتاب عند الحاجة (عرض النص للطالب أو طباعته في ورقة الاختبار) ولا يُخزَّن في قاعدة البيانات."""
-    key = (lesson["start"], lesson["end"], len(idx[0]))
+def _ok_sentence(sent):
+    """جملة صالحة لأن تكون من نص القراءة (لا تعليمات تمرين): بلا أفعال أمر/عناوين تمارين، ولا ترقيم تمارين، وتنتهي بعلامة ترقيم."""
+    if not sent or _CUES.search(sent) or re.match(r"^\d+\s", sent) or _LETTER_ITEM.match(sent):
+        return False
+    if sum(c.isalpha() for c in sent) < 0.7 * len(sent):
+        return False
+    return sent[-1] in ".!?”\"'"
+
+
+def _page_lines(text):
+    """سطور الصفحة البصرية (كما استخرجها PDF) وأرقام الهامش 5,10,15..."""
+    lines, markers = [], []
+    for ln in str(text).splitlines():
+        t = ln.strip()
+        if not t or "قيد الإعداد" in t:
+            continue
+        if re.fullmatch(r"\d{1,3}", t):
+            markers.append(int(t))
+        else:
+            lines.append(fix_ligatures(t))
+    return lines, markers
+
+
+def _marker_count(markers):
+    """طول المتتالية 5,10,15,... في أرقام الصفحة (ترقيم أسطر نص القراءة يبدأ دائمًا من 5)."""
+    ms, n, c = set(markers), 5, 0
+    while n in ms:
+        c += 1
+        n += 5
+    return c
+
+
+def _article_lines(lines):
+    """أطول مقطع متصل من أسطر النص النثري في الصفحة (سطور بصرية كما هي)."""
+    text, starts = "", []
+    for ln in lines:
+        starts.append(len(text))
+        text += ln + " "
+    bounds = [0] + [m.end() for m in re.finditer(r"(?<=[.!?])\s+(?=[A-Z“\"'‘])", text)] + [len(text)]
+    ok_line = [False] * len(lines)
+    for a, b in zip(bounds, bounds[1:]):
+        if _ok_sentence(text[a:b].strip()):
+            for i, st in enumerate(starts):
+                en = starts[i + 1] if i + 1 < len(starts) else len(text)
+                if st < b and en > a:
+                    ok_line[i] = True
+    best, cur = [], []
+    for ln, ok in zip(lines, ok_line):
+        if ok:
+            cur.append(ln)
+        else:
+            best = cur if len(cur) > len(best) else best
+            cur = []
+    return cur if len(cur) > len(best) else best
+
+
+def _paragraphs(lines):
+    """تقسيم السطور إلى فقرات: نهاية الفقرة سطر ينتهي بنقطة وهو أقصر بوضوح من بقية السطور."""
+    if not lines:
+        return []
+    full = max(len(l) for l in lines)
+    paras, cur = [], []
+    for i, ln in enumerate(lines):
+        cur.append(ln)
+        if i < len(lines) - 1 and ln[-1] in ".!?”\"'" and len(ln) < 0.72 * full:
+            paras.append(cur)
+            cur = []
+    if cur:
+        paras.append(cur)
+    return paras
+
+
+def _number(paragraphs):
+    """[[(رقم أو None, سطر)]]: يُرقَّم كل سطر خامس 5,10,15... بالتسلسل عبر الفقرات."""
+    out, n = [], 0
+    for para in paragraphs:
+        rows = []
+        for ln in para:
+            n += 1
+            rows.append((n if n % 5 == 0 else None, ln))
+        out.append(rows)
+    return out
+
+
+def reading_structure(idx, lesson, slug=None):
+    """نص القراءة لدرس كما في الكتاب: فقرات وأسطر بترتيبها الأصلي مع الترقيم 5,10,15...
+    1) نص أدخله/اعتمده المشرف يدويًا إن وُجد (reading_texts).
+    2) وإلا يُستخرج تلقائيًا من صفحة واحدة: الصفحة ذات ترقيم الهامش 5,10,15 (وإلا الصفحة ذات أطول نثر)،
+       ويقتصر على السطور النثرية المتصلة، بحد أقصى (آخر رقم + 4) سطرًا.
+    يعيد {"paragraphs": [[(num|None, line)]], "page": رقم صفحة ملف PDF أو None, "source": "manual"|"auto"} أو None."""
+    key = (slug, lesson["title"], lesson["start"], lesson["end"])
     if key in _FULL_CACHE:
         return _FULL_CACHE[key]
-    try:
-        pages = select_context(idx, lesson["title"], (lesson["start"], lesson["end"]), max_chars=200000)
-    except Exception:  # noqa: BLE001
-        return ""
-    runs, cur = [], []
-    for p in pages:
-        for sent in _SENT.split(fix_ligatures(_clean_page(p["text"]))):
-            sent = sent.strip()
-            if _prose(sent):
-                cur.append(sent)
-            elif cur:
-                runs.append(cur)
-                cur = []
-    if cur:
-        runs.append(cur)
-    blocks = [" ".join(r) for r in runs if sum(len(x.split()) for x in r) >= min_run_words]
-    text = "\n\n".join(blocks)
-    _FULL_CACHE[key] = text
-    return text
+    result = None
+    if slug:
+        try:
+            import reading_texts
+            manual = reading_texts.get_text(slug, lesson["title"])
+        except Exception:  # noqa: BLE001
+            manual = None
+        if manual and manual.strip():
+            paras = [[l.strip() for l in blk.splitlines() if l.strip()] for blk in re.split(r"\n\s*\n", manual.strip())]
+            result = {"paragraphs": _number([p for p in paras if p]), "page": None, "source": "manual"}
+    if result is None:
+        try:
+            pages = select_context(idx, lesson["title"], (lesson["start"], lesson["end"]), max_chars=200000)
+        except Exception:  # noqa: BLE001
+            pages = []
+        cands = []
+        for p in pages:
+            lines, markers = _page_lines(p["text"])
+            art = _article_lines(lines)
+            cands.append((_marker_count(markers), sum(len(x.split()) for x in art), p["page"], art, markers))
+        cands = [c for c in cands if c[1] >= 40]
+        if cands:
+            mc, _w, page, art, markers = max(cands, key=lambda c: (c[0] >= 2, c[0], c[1]))
+            if mc >= 2:
+                art = art[: 5 * mc + 4]                    # لا يزيد النص عن آخر رقم + 4 أسطر
+            result = {"paragraphs": _number(_paragraphs(art)), "page": page, "source": "auto"}
+    _FULL_CACHE[key] = result
+    return result
+
+
+def reading_plain(struct):
+    """النص بلا ترقيم (فقرات مفصولة بسطر فارغ)."""
+    return "\n\n".join("\n".join(ln for _n, ln in para) for para in (struct or {}).get("paragraphs", []))
+
+
+def reading_html(struct):
+    """عرض النص بأسطره وفقراته وترقيم الهامش (لشاشة قيّمني)."""
+    import html as _h
+    parts = []
+    for para in struct["paragraphs"]:
+        rows = "".join(
+            f"<div style='display:flex;gap:.9em'><span style='width:1.8em;text-align:right;color:#888;flex:none'>"
+            f"{n if n else ''}</span><span>{_h.escape(ln)}</span></div>" for n, ln in para)
+        parts.append(f"<div style='margin-bottom:.7em'>{rows}</div>")
+    return "<div dir='ltr' style='text-align:left;font-family:Georgia,serif'>" + "".join(parts) + "</div>"
+
+
+def full_reading_text(idx, lesson, slug=None):
+    """النص كسلسلة عادية (للتوافق)."""
+    return reading_plain(reading_structure(idx, lesson, slug))

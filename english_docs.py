@@ -469,7 +469,12 @@ def build_exam_docx(header, selected_by_type, marks, logo_bytes, load_image=None
                 pk = q.get("passage_key") or q["passage"][:40]
                 if pk not in printed:
                     printed.add(pk)
-                    _para(doc.add_paragraph(), q["passage"], 11)
+                    _para(doc.add_paragraph(), "Read the following text, then answer the questions below:", 12, True)
+                    if q.get("passage_title"):
+                        _para(doc.add_paragraph(), q["passage_title"], 12, True)
+                    for blk in str(q["passage"]).split("\n\n"):          # أسطر الكتاب وفقراته كما هي
+                        _para(doc.add_paragraph(), blk, 11)
+                        doc.add_paragraph().paragraph_format.space_after = Pt(2)
             if qtype == "tf":
                 _para(doc.add_paragraph(), f"{n}. {q['question']}   (      )", 12)
             else:
