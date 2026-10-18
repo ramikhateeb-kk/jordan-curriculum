@@ -26,6 +26,18 @@ TIMEOUT = 20
 EXERCISES_MAX = 4000
 
 
+def _check(r):
+    """يحوّل خطأ مخطط قاعدة البيانات القديم إلى رسالة واضحة تدلّ على الحل."""
+    try:
+        catalog._check(r)
+    except RuntimeError as e:
+        m = str(e)
+        if any(x in m for x in ("text_key", "position", "42703", "42P10", "23502", "no unique or exclusion")):
+            raise RuntimeError("جدول reading_texts في Supabase غير محدَّث لهذا الإصدار: شغّل ملف supabase_materials_4.sql "
+                               "مرة واحدة ثم أعد المحاولة. (" + m[:140] + ")") from e
+        raise
+
+
 # ---------------------------------------------------------------- التخزين (أكثر من نص لكل درس)
 EX_KEY = "_ex"        # صف خاص بتمارين الدرس
 
@@ -57,7 +69,7 @@ def _all(book_slug):
         r = requests.get(f"{url}/rest/v1/reading_texts", headers=h, timeout=TIMEOUT,
                          params={"select": "lesson_title,text_key,position,title,text,exercises,source",
                                  "book_slug": f"eq.{book_slug}", "order": "position.asc,id.asc"})
-        catalog._check(r)
+        _check(r)
         out = {}
         for x in r.json():
             out.setdefault(x["lesson_title"], []).append(
@@ -95,7 +107,7 @@ def _upsert(book_slug, lesson_title, key, position, title, text, source, user_id
         r = requests.post(f"{url}/rest/v1/reading_texts",
                           headers={**h, "Prefer": "resolution=merge-duplicates,return=minimal"}, timeout=TIMEOUT,
                           params={"on_conflict": "book_slug,lesson_title,text_key"}, data=json.dumps([row]))
-        catalog._check(r)
+        _check(r)
     else:
         db = _local()
         rows = [x for x in db.get(f"{book_slug}|{lesson_title}", []) if x["key"] != key]
@@ -131,7 +143,7 @@ def delete_text(book_slug, lesson_title, key):
         r = requests.delete(f"{url}/rest/v1/reading_texts", headers=h, timeout=TIMEOUT,
                             params={"book_slug": f"eq.{book_slug}", "lesson_title": f"eq.{lesson_title}",
                                     "text_key": f"eq.{key}"})
-        catalog._check(r)
+        _check(r)
     else:
         db = _local()
         k = f"{book_slug}|{lesson_title}"

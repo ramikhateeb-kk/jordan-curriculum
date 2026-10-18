@@ -272,6 +272,21 @@ def cached_answer(book_key, topic, pages, request, _idx):
 
 
 # ---------------------------------------------------------------- اشرح لي
+# ---- اتجاه النص في «اشرح لي» و«قيّمني»: الإنجليزية من اليسار لليمين والعربية من اليمين لليسار
+# الواجهة عمومًا RTL؛ هنا نجعل اتجاه الأساس حسب لغة الكتاب (إنجليزي ← LTR)، وكل فقرة/خيار/سطر يتبع لغته تلقائيًا
+# (unicode-bidi: plaintext) فتبقى الشروح العربية لكتاب إنجليزي مضبوطة أيضًا. يُطبَّق على كل ما يلي العلامة في الصفحة.
+if action in ("explain", "quiz"):
+    _base, _side = ("ltr", "left") if lang == "en" else ("rtl", "right")
+    _S = ':is([data-testid="stElementContainer"], .element-container):has(#bidi-marker) ~ ' \
+         ':is([data-testid="stElementContainer"], .element-container)'
+    st.markdown(
+        f"""<div id="bidi-marker"></div><style>
+{_S}, {_S} * {{ direction: {_base} !important; }}
+{_S} :is(p, li, h1, h2, h3, h4, h5, h6, td, th, blockquote, label) {{ unicode-bidi: plaintext !important; text-align: start !important; }}
+{_S} :is(textarea, input) {{ direction: {_base} !important; text-align: {_side} !important; unicode-bidi: plaintext !important; }}
+.stApp:has(#bidi-marker) [data-testid="stChatInput"] textarea {{ direction: {_base} !important; unicode-bidi: plaintext !important; text-align: start !important; }}
+</style>""", unsafe_allow_html=True)
+
 if action == "explain":
     ALL_BOOK, WHOLE_UNIT = "كل الكتاب", "الوحدة كاملة"
     pages, topic, unit_name = None, "", ALL_BOOK
