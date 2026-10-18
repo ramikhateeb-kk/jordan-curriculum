@@ -367,11 +367,15 @@ def _attach_reading_texts(sel, idx, flat_lessons, slug):
             lt, lesson = q.get("ref_lesson"), by_title.get(q.get("ref_lesson"))
             if lt and lesson:
                 if lt not in texts:
-                    texts[lt] = reading_texts.get_text(slug, lesson, idx)
-                row = texts[lt]
-                if row and row.get("text"):
-                    q = {**q, "passage": row["text"], "passage_key": f"ref-{lt}",
-                         "passage_title": row.get("title") or q.get("ref_title")}
+                    texts[lt] = reading_texts.get_texts(slug, lesson, idx)
+                rows = texts[lt]
+                tk = q.get("ref_text_key")
+                mine = [r for r in rows if r["key"] == tk] or (rows if (len(rows) == 1 or not tk) else [])
+                if mine:        # نص السؤال وحده (أو كل نصوص الدرس لسؤال قديم لا يعرف نصه)
+                    q = {**q, "passage": "\n\n".join(r["text"] for r in mine),
+                         "passage_key": f"ref-{lt}-{tk or 'all'}",
+                         "passage_title": (reading_texts.display_title(lesson, mine[0], rows) if len(mine) == 1
+                                           else q.get("ref_title"))}
             enriched.append(q)
         first = {}
         for i, q in enumerate(enriched):

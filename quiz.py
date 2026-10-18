@@ -168,20 +168,28 @@ def _generate_reference(client, idx, slug, lesson, qtype, asked_texts, style, la
     المصدر: النص المحفوظ للدرس (المستخرج أو المُدخَل يدويًا) مع صفحات الكتاب للتحقق من الصفحة والاقتباسات."""
     off = int(lesson.get("page_offset") or 0)
     pages = select_context(idx, lesson["title"], (lesson["start"], lesson["end"]), max_chars=CONTEXT_BUDGET)
-    row = reading_texts.get_text(slug, lesson, idx)                 # النص المنظَّف وتمارينه (يُستخرج مرة واحدة أو يدويًا)
-    clean = ((row or {}).get("text") or "").strip()
+    rows = reading_texts.get_texts(slug, lesson, idx)               # نصوص الدرس (قد يكون فيه أكثر من نص بموضوعات مختلفة)
+    chosen = None
+    if rows:                                                        # نسأل عن نص واحد في كل سؤال، ونتجنّب تكرار النص السابق
+        pool = [r for r in rows if r["key"] != lesson.get("_last_text")] or rows
+        chosen = random.choice(pool)
+        lesson["_last_text"] = chosen["key"]
+    clean = ((chosen or {}).get("text") or "").strip()
     raw_words = len(sp.fix_ligatures(" ".join(p["text"] for p in pages)).split())
     if not clean and raw_words < 60:
         return None                                    # لا يوجد نص كافٍ في الدرس
     blocks = []
     if clean:
-        blocks.append("READING TEXT (as printed in the book):\n" + clean)
+        head = reading_texts.display_title(lesson, chosen, rows)
+        note = (f" The lesson has {len(rows)} different texts; the question must be about THIS text only."
+                if len(rows) > 1 else "")
+        blocks.append(f"READING TEXT \"{head}\" (as printed in the book).{note}\n" + clean)
     if pages:
         blocks.append("BOOK PAGES (with PRINTED page numbers):\n" + "\n\n".join(
             f"=== page {p['page'] - off} ===\n{sp.fix_ligatures(p['text'])}" for p in pages))
     schema = SPECS[qtype][1].replace('"page":12}', '"page":6,"quotes":[]}')
     asked = "\n".join(f"- {a}" for a in asked_texts) or ("none" if lang == "en" else "لا يوجد")
-    exercises = (row or {}).get("exercises") or ""
+    exercises = reading_texts.exercises_of(slug, lesson["title"])
     if lang == "ar":
         system, prompt = sp.SYSTEM_REFERENCE_AR, sp.reference_prompt_ar(lesson, "\n\n".join(blocks), qtype, asked, schema,
                                                                        style, exercises)
@@ -189,7 +197,7 @@ def _generate_reference(client, idx, slug, lesson, qtype, asked_texts, style, la
         system, prompt = sp.SYSTEM_REFERENCE_EN, sp.reference_prompt(lesson, "\n\n".join(blocks), qtype, asked, schema,
                                                                       style, exercises)
     valid_printed = {p["page"] - off for p in pages}
-    corpus = clean + " " + " ".join(p["text"] for p in pages)
+    corpus = clean if clean else " ".join(p["text"] for p in pages)       # الاقتباس من النص المسؤول عنه السؤال
     for _ in range(2):
         q = _json(client, system, prompt)
         if not isinstance(q, dict):
@@ -211,7 +219,9 @@ def _generate_reference(client, idx, slug, lesson, qtype, asked_texts, style, la
         if q["page"] is None:
             q.pop("page")
         if _valid(q, qtype, ctx_ok) and not ministry.too_similar(slug, str(q.get("question", ""))):
-            q["ref_title"] = (row or {}).get("title") or sp.text_title(lesson["title"])
+            q["ref_title"] = reading_texts.display_title(lesson, chosen, rows) if chosen else sp.text_title(lesson["title"])
+            if chosen:
+                q["ref_text_key"] = chosen["key"]
             q["ref_page"], q["ref_lesson"], q["ref_lang"] = printed, lesson["title"], lang
             _finalize(q, qtype, lesson)
             return q, _save(slug, lesson, qtype, q)
@@ -228,8 +238,8 @@ def _generate(client, idx, slug, lesson, qtype, asked_texts, passage=None):
         return None, None
     style = ministry.style_snippet(slug, qtype, lang)              # نمط الأسئلة الوزارية (إن وُجد)
     kind = sp.lesson_kind(lesson["title"]) if lang == "en" else None
-    stored = reading_texts._row(slug, lesson["title"])             # نص قراءة محفوظ لهذا الدرس (آليًا أو يدويًا، أي لغة)
-    if kind in sp.PASSAGE_KINDS or (stored and stored.get("text")):
+    stored = reading_texts.texts_of(slug, lesson["title"])         # نصوص قراءة محفوظة لهذا الدرس (آليًا أو يدويًا، أي لغة)
+    if kind in sp.PASSAGE_KINDS or stored:
         if sp.READING_MODE == "reference" or lang != "en":         # سؤال يشير إلى النص (الافتراضي)
             res = _generate_reference(client, idx, slug, lesson, qtype, asked_texts, style, lang)
         else:                                                      # عرض قطعة حرفية ثم سؤال عليها
@@ -438,10 +448,12 @@ def render_quiz(idx, slug, lessons):
         else:
             st.caption(f'📖 From your reading of "{q["ref_title"]}"' + (f" (page {q['ref_page']})" if q.get("ref_page") else ""))
         _ref = next((l for l in lessons if l["title"] == q.get("ref_lesson")), None)
-        _row = reading_texts.get_text(slug, _ref, idx) if _ref else None
-        if _row and _row.get("text"):
+        _rows = reading_texts.get_texts(slug, _ref, idx) if _ref else []
+        _mine = [r for r in _rows if r["key"] == q.get("ref_text_key")] or (_rows if len(_rows) == 1 or not q.get("ref_text_key") else [])
+        if _mine:
             with st.expander("📄 عرض النص"):
-                reading_texts.show(_row, q.get("ref_lang") or "en")
+                for _r in _mine:                                   # نص السؤال وحده؛ وإن لم يُعرف النص (سؤال قديم) كل نصوص الدرس
+                    reading_texts.show({**_r, "title": reading_texts.display_title(_ref, _r, _rows)}, q.get("ref_lang") or "en")
     if q.get("passage"):
         with st.container(border=True):
             _md_u(q["passage"])

@@ -1211,14 +1211,16 @@ def _transfer_section(book, flat_lessons, user):
 
 
 def _reading_section(book, flat_lessons, user, lang, idx):
-    """نموذج إضافة نصوص القراءة (عربية أو إنجليزية) يدويًا للمدير والمشرف، مع خيار الاستخراج بالذكاء الاصطناعي."""
+    """نموذج إدخال نصوص القراءة (عربية أو إنجليزية) يدويًا للمدير والمشرف. الدرس الواحد قد يحوي أكثر من نص بموضوعات مختلفة،
+    ولكل نص عنوانه، وكل سؤال يُبنى على نص واحد منها ويعرض الطالب ذلك النص وحده."""
     slug = book["slug"]
-    st.caption("أضف نص أي درس بتنسيق الكتاب (سطر الكتاب = سطر، والفقرة تُفصل بسطر فارغ). يُعرض للطالب بزر «عرض النص» ويُطبع كاملًا "
-               "في ورقة الاختبار قبل أسئلته، وتُبنى عليه أسئلة «من خلال قراءتك للنص». يصلح للعربية والإنجليزية، ولأي درس. "
-               "يمكنك أيضًا أن يستخرجه الذكاء الاصطناعي من صفحات الكتاب ثم تراجعه وتعدّله.")
+    st.caption("أضف نصوص أي درس بتنسيق الكتاب (سطر الكتاب = سطر، والفقرة تُفصل بسطر فارغ). **لكل نص عنوانه** وإن كان في الدرس "
+               "أكثر من نص فأضف كلًّا منه على حدة: تُبنى أسئلة القراءة على نص واحد، ويعرض «قيّمني» ذلك النص وحده، وتطبع "
+               "ورقة الاختبار كل نص مرة واحدة قبل أسئلته. يصلح للعربية والإنجليزية ولأي درس.")
     if not flat_lessons:
         st.info("لم تُدخل دروس هذا الكتاب بعد.")
         return
+    reading_texts.input_direction_css(lang)
     saved = reading_texts.list_rows(slug)
     mark = {"ai": "🤖", "manual": "✅"}
     titles = [l["title"] for l in flat_lessons]
@@ -1230,49 +1232,74 @@ def _reading_section(book, flat_lessons, user, lang, idx):
         st.info("لا توجد دروس مطابقة. ألغِ الفلتر لعرض كل الدروس.")
         return
     sel = st.selectbox("الدرس", titles, key=f"rtsel_{slug}",
-                       format_func=lambda t: f"{mark.get(saved[t]['source'], '✅') if t in saved else '⬜'} {t}")
+                       format_func=lambda t: (f"{mark.get(saved[t]['source'], '✅')} {t} — {saved[t]['count']} نص"
+                                              if t in saved else f"⬜ {t}"))
     lesson = next(l for l in flat_lessons if l["title"] == sel)
-    row = reading_texts._row(slug, sel)
     k = f"rt_{slug}_{abs(hash(sel)) % 10**8}"
-    if row and row.get("text"):
-        st.caption("معاينة كما سيظهر النص للطالب:")
-        with st.container(border=True):
-            reading_texts.show(row, lang)
-    c1, c2 = st.columns(2)
-    if idx is not None and c1.button("🤖 استخراج من صفحات الكتاب بالذكاء الاصطناعي", key=f"{k}_ai"):
-        auth_ui.require_quota_or_stop(user)
-        with st.spinner("جارٍ استخراج النص..."):
-            got = reading_texts.extract_with_ai(get_client(), idx, lesson)
-        if got:
-            reading_texts.save_row(slug, sel, got[0], got[1], got[2], "ai", user["id"])
-            for suffix in ("ti", "t", "e"):
-                st.session_state.pop(f"{k}_{suffix}", None)
+    rows = reading_texts.texts_of(slug, sel)
+    ver = st.session_state.get(f"{k}_ver", 0)          # يتغير بعد كل حفظ لتفريغ حقول النص الجديد
+
+    # ---- النصوص الحالية للدرس
+    st.markdown(f"**نصوص هذا الدرس: {len(rows)}**" if rows else "**لا توجد نصوص لهذا الدرس بعد.**")
+    for r in rows:
+        kr = f"{k}_{r['key']}"
+        with st.expander(f"{mark.get(r['source'], '✅')} {reading_texts.display_title(lesson, r, rows)}",
+                         expanded=len(rows) == 1):
+            with st.container(border=True):
+                reading_texts.show({**r, "title": reading_texts.display_title(lesson, r, rows) if r.get("title") else None},
+                                   lang)
+            t_new = st.text_input("📄 عنوان النص", r.get("title") or "", key=f"{kr}_ti")
+            x_new = st.text_area("📄 النص", r["text"], height=260, key=f"{kr}_t",
+                                 help="الصق النص كما في الكتاب. اترك سطرًا فارغًا بين الفقرات. في الشعر: كل بيت/شطر في سطر.")
+            b1, b2 = st.columns(2)
+            if b1.button("💾 حفظ التعديل", key=f"{kr}_s", type="primary", disabled=not x_new.strip()):
+                reading_texts.save_text(slug, sel, r["key"], t_new.strip() or None, x_new.strip(), "manual", user["id"])
+                st.rerun()
+            if b2.button("🗑️ حذف هذا النص", key=f"{kr}_d"):
+                reading_texts.delete_text(slug, sel, r["key"])
+                st.rerun()
+
+    # ---- إضافة نص جديد
+    with st.container(border=True):
+        st.markdown("**➕ إضافة نص جديد إلى هذا الدرس**")
+        n_title = st.text_input("📄 عنوان النص (يُنصح به إن كان في الدرس أكثر من نص)", key=f"{k}_nt{ver}")
+        n_text = st.text_area("📄 النص", height=220, key=f"{k}_nx{ver}",
+                              help="الصق النص كما في الكتاب. اترك سطرًا فارغًا بين الفقرات. في الشعر: كل بيت/شطر في سطر.")
+        if st.button("💾 حفظ كنص جديد", key=f"{k}_add{ver}", type="primary", disabled=not n_text.strip()):
+            reading_texts.save_text(slug, sel, None, n_title.strip() or None, n_text.strip(), "manual", user["id"])
+            st.session_state[f"{k}_ver"] = ver + 1
             st.rerun()
-        else:
-            st.error("لم يُعثر على نص قراءة في صفحات هذا الدرس. أدخله يدويًا أدناه.")
-    if row and c2.button("🗑️ حذف نص هذا الدرس", key=f"{k}_del"):
-        reading_texts.delete_row(slug, sel)
-        for suffix in ("ti", "t", "e"):
-            st.session_state.pop(f"{k}_{suffix}", None)
-        st.rerun()
-    title = st.text_input("عنوان النص (اختياري)", (row or {}).get("title") or "", key=f"{k}_ti")
-    text = st.text_area("نص الدرس", (row or {}).get("text") or "", height=320, key=f"{k}_t",
-                        help="الصق النص كما في الكتاب. اترك سطرًا فارغًا بين الفقرات. في الشعر: كل بيت/شطر في سطر.")
-    ex = st.text_area("تمارين الدرس أو ملاحظات للاستئناس عند توليد الأسئلة (اختياري)", (row or {}).get("exercises") or "",
-                      height=120, key=f"{k}_e")
-    if st.button("💾 حفظ نص الدرس", key=f"{k}_s", type="primary", disabled=not text.strip()):
-        reading_texts.save_row(slug, sel, title.strip() or None, text.strip(), ex, "manual", user["id"])
-        st.success("حُفظ النص.")
-        st.rerun()
+
+    # ---- تمارين الدرس
+    with st.expander("📝 تمارين الدرس أو ملاحظات للاستئناس عند توليد الأسئلة (اختياري)"):
+        ex_new = st.text_area("📄 التمارين", reading_texts.exercises_of(slug, sel), height=140, key=f"{k}_ex")
+        if st.button("💾 حفظ التمارين", key=f"{k}_exs"):
+            reading_texts.save_exercises(slug, sel, ex_new, user["id"])
+            st.rerun()
+
+    # ---- مساعدة اختيارية
     if idx is not None:
+        with st.expander("🤖 استخراج النصوص من صفحات الكتاب بالذكاء الاصطناعي (اختياري)"):
+            ok = True
+            if rows:
+                ok = st.checkbox("أؤكد استبدال النصوص الحالية لهذا الدرس بالمستخرَجة", key=f"{k}_rep")
+            if st.button("🤖 استخراج", key=f"{k}_ai", disabled=not ok):
+                auth_ui.require_quota_or_stop(user)
+                with st.spinner("جارٍ استخراج النصوص..."):
+                    got = reading_texts.extract_with_ai(get_client(), idx, lesson)
+                if got:
+                    reading_texts.replace_lesson(slug, sel, got[0], got[1], "ai", user["id"])
+                    st.rerun()
+                else:
+                    st.error("لم يُعثر على نص قراءة في صفحات هذا الدرس. أدخله يدويًا أعلاه.")
         with st.expander("📋 النص الخام لصفحات هذا الدرس (للنسخ منه)"):
             raw = "\n\n".join(f"--- صفحة {p['page'] - int(lesson.get('page_offset') or 0)} ---\n{p['text']}"
                                for p in select_context(idx, sel, (lesson["start"], lesson["end"]), max_chars=200000))
             st.text_area("النص كما استُخرج من ملف الكتاب", raw, height=240, key=f"{k}_raw")
     if saved:
-        with st.expander(f"📑 الدروس التي لها نص ({len(saved)})"):
+        with st.expander(f"📑 الدروس التي لها نصوص ({len(saved)})"):
             for t, v in saved.items():
-                st.write(f"{mark.get(v['source'], '✅')} {t} — {v['words']} كلمة")
+                st.write(f"{mark.get(v['source'], '✅')} {t} — {v['count']} نص، {v['words']} كلمة")
 
 
 def _style_section(book, user, lang):
