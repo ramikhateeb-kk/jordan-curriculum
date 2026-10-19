@@ -259,16 +259,46 @@ def select_context(idx, query, pages=None, max_chars=FULL_SEND_LIMIT, k=MAX_RANK
 
 
 # ------------------------------------------------------------ توليد الإجابة
-def build_prompt(question, pages_text):
+SYSTEM_EXPLAIN_EN = (
+    "أنت معلم لغة إنجليزية خبير للمنهاج الأردني تشرح لطلاب المدرسة. التزم بما يلي:\n"
+    "1) محتوى الدرس وأمثلته: من نص كتاب الطالب المرفق فقط، واذكر رقم الصفحة بين قوسين بعد ما تنقله منه، مثل (صفحة 12). "
+    "لا تضف معلومات عن محتوى الدرس ليست فيه. ترجمة الكلمات والجمل إلى العربية مسموحة.\n"
+    "2) تمارين كتاب الأنشطة والأسئلة الوزارية المرفقة: استعملها أمثلةً للتطبيق ولبيان كيف يُسأل الطالب في الامتحان، ولا تغيّر نصّها، "
+    "ولا تذكر إجابة صحيحة إلا إن وردت معها.\n"
+    "3) شرح قواعد اللغة (Grammar) الخارجي: إن ظهرت في «القواعد الخارجية» علامة مثل <<GRAMMAR:1>> فلا تشرح القاعدة من عندك. "
+    "إن كان طلب الطالب يخص شرح القاعدة أو شرح الدرس فضع العلامة نفسها بالضبط على سطر مستقل في المكان المناسب، وسيُدرَج الشرح "
+    "الكامل (من مصادر خارجية) مكانها تلقائيًا؛ ثم أكمل بما ورد في الكتاب.\n"
+    "4) اللغة والتنسيق: الشرح بالعربية المبسطة، وكل الجمل والأمثلة الإنجليزية بالإنجليزية. نظّم الإجابة بعناوين (##) وفقرات قصيرة، "
+    "واعرض الأمثلة في جدول بعمودين (| English | العربية |). لا تخلط العربية والإنجليزية في السطر الواحد إلا للمصطلحات.\n"
+    "5) إن كان الطلب سؤالًا محددًا فأجب عنه مباشرة وباختصار أولًا. وإن كان شرح درس فاستعمل هذا القالب وأسقط ما لا مادة له: "
+    "## 🎯 الفكرة باختصار — (علامة القاعدة إن وُجدت) — ## 📖 كما ورد في كتابك — ## ✏️ تمارين من كتاب الأنشطة — "
+    "## 📝 كيف تُسأل في الامتحان — ## ✅ ملخص.\n"
+    "6) إن لم تجد المعلومة في المصادر المرفقة فقل: «لم أجد هذه المعلومة في المنهاج»."
+)
+
+
+def build_prompt(question, pages_text, extras=None):
     ctx = "\n\n".join(f"=== صفحة {p['page']} ===\n{p['text']}" for p in pages_text)
-    return f"نص من كتاب المنهاج (المصدر الوحيد المسموح به للإجابة):\n{ctx}\n\nطلب الطالب/المعلم:\n{question}"
+    out = f"نص من كتاب المنهاج (المصدر الوحيد المسموح به للإجابة):\n{ctx}\n\n"
+    extras = extras or {}
+    if extras.get("workbook"):
+        out += f"تمارين كتاب الأنشطة لهذا الدرس (للتطبيق والأمثلة):\n{extras['workbook']}\n\n"
+    if extras.get("ministry"):
+        out += f"أسئلة وزارية سابقة على هذا الدرس (لبيان كيف يُسأل في الامتحان):\n{extras['ministry']}\n\n"
+    if extras.get("grammar"):
+        out += "القواعد الخارجية المتوفرة (شرح كامل جاهز يُدرَج بالعلامة):\n" + "\n".join(
+            f"<<GRAMMAR:{g['id']}>> — شرح قاعدة درس: {g['lesson']}" for g in extras["grammar"]) + "\n\n"
+    return out + f"طلب الطالب/المعلم:\n{question}"
 
 
-def answer(client, question, pages_text):
+def answer(client, question, pages_text, extras=None, book_lang="ar"):
+    """الشرح من المنهاج. للكتب الإنجليزية: قالب منظّم (شرح عربي وأمثلة إنجليزية) مع تمارين كتاب الأنشطة والأسئلة الوزارية
+    وعلامات إدراج شرح القواعد الخارجي (<<GRAMMAR:n>>) التي يستبدلها التطبيق بالشرح المخزَّن."""
     if not pages_text:
         return "لم أجد نصًا لهذا الدرس في الكتاب لأجيب اعتمادًا عليه."
-    prompt = build_prompt(question, pages_text)
+    english = book_lang == "en" or bool(extras and any(extras.get(k) for k in ("workbook", "ministry", "grammar")))
+    system = SYSTEM_EXPLAIN_EN if english else SYSTEM
     r = client.models.generate_content(
-        model=GEMINI_MODEL, contents=prompt,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM, temperature=0))
+        model=GEMINI_MODEL, contents=build_prompt(question, pages_text, extras),
+        config=types.GenerateContentConfig(system_instruction=system, temperature=0))
     return r.text

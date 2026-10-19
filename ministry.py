@@ -29,6 +29,7 @@ import auth_ui
 import catalog
 import images
 import qbank
+import grammar_ext
 import reading_texts
 import subject_profiles as sp
 from config import BASE, GEMINI_MODEL
@@ -748,6 +749,17 @@ def style_snippet(book_slug, qtype, lang="ar", k=3):
     return head + "\n\n".join(parts)
 
 
+def examples_for_lessons(book_slug, lesson_titles, limit=6, lang="en"):
+    """أسئلة وزارية معتمدة مرتبطة بهذه الدروس، منسّقة للاستشهاد بها في «اشرح لي». '' إن لم توجد."""
+    try:
+        titles = set(lesson_titles)
+        rows = [r for r in _approved_cached(book_slug) if r.get("lesson_title") in titles]
+    except Exception:  # noqa: BLE001
+        return ""
+    rows = sorted(rows, key=lambda r: r["id"])[:limit]
+    return "\n\n".join(_fmt_example(r["data"], lang) for r in rows)
+
+
 def _n(t):
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]|_", " ", _norm(str(t)).lower())).strip()
 
@@ -1302,6 +1314,49 @@ def _reading_section(book, flat_lessons, user, lang, idx):
                 st.write(f"{mark.get(v['source'], '✅')} {t} — {v['count']} نص، {v['words']} كلمة")
 
 
+def _grammar_section(book, flat_lessons, user, lang, idx):
+    slug = book["slug"]
+    st.caption("شرح مبسّط وشامل لقاعدة كل درس Grammar من **مصادر خارجية غير المنهاج** (شرح عربي وأمثلة إنجليزية)، يُولَّد مرة واحدة "
+               "بالبحث في الإنترنت ثم يُعرض للطالب في «اشرح لي». راجعه وعدّله هنا، أو أعد توليده.")
+    if lang != "en":
+        st.info("هذه الميزة لكتب اللغة الإنجليزية.")
+        return
+    lessons = [l for l in flat_lessons if sp.lesson_kind(l["title"]) in grammar_ext.GRAMMAR_KINDS]
+    if not lessons:
+        st.info("لا توجد دروس قواعد (Grammar) في هذا الكتاب.")
+        return
+    rows = grammar_ext.list_rows(slug)
+    sel = st.selectbox("الدرس", [l["title"] for l in lessons], key=f"gx_sel_{slug}",
+                       format_func=lambda t: (("✅ " if rows[t].get("source") == "manual" else "🤖 ") + t) if t in rows else "⬜ " + t)
+    lesson = next(l for l in lessons if l["title"] == sel)
+    k = f"gx_{slug}_{abs(hash(sel)) % 10**8}"
+    row = rows.get(sel)
+    if row:
+        with st.container(border=True):
+            st.markdown(grammar_ext.render_md(row))
+    else:
+        st.info("لم يُولَّد شرح لهذا الدرس بعد (يُولَّد تلقائيًا عند أول طلب شرح، أو ولّده الآن).")
+    if idx is not None and st.button("🔎 توليد / إعادة توليد الشرح بالبحث في الإنترنت", key=f"{k}_gen"):
+        auth_ui.require_quota_or_stop(user)
+        with st.spinner("جارٍ البحث وإعداد الشرح..."):
+            got = grammar_ext.generate(get_client(), idx, lesson)
+        if got:
+            grammar_ext.save_row(slug, sel, got[0], got[1], got[2], "ai", user["id"])
+            st.session_state.pop(f"{k}_txt", None)
+            st.rerun()
+        else:
+            st.error("تعذّر إعداد الشرح. حاول مرة أخرى.")
+    txt = st.text_area("تعديل الشرح (Markdown)", (row or {}).get("content") or "", height=320, key=f"{k}_txt")
+    c1, c2 = st.columns(2)
+    if c1.button("💾 حفظ كشرح معتمد", key=f"{k}_save", type="primary", disabled=not txt.strip()):
+        grammar_ext.save_row(slug, sel, (row or {}).get("title"), txt.strip(), (row or {}).get("sources"), "manual", user["id"])
+        st.rerun()
+    if row and c2.button("🗑️ حذف الشرح", key=f"{k}_del"):
+        grammar_ext.delete_row(slug, sel)
+        st.session_state.pop(f"{k}_txt", None)
+        st.rerun()
+
+
 def _style_section(book, user, lang):
     slug = book["slug"]
     approved = list_questions(slug, status="approved")
@@ -1345,8 +1400,8 @@ def render_ministry(book, flat_lessons, user, lang="ar", idx=None):
             return
         _bank_tab(book, user, False, lang)
         return
-    t1, t2, t4, t5, t3 = st.tabs(["📚 البنك", "⬆️ رفع ومراجعة", "🏦 نقل إلى بنك قيّمني", "📄 نصوص القراءة",
-                                  "🎯 نمط الأسئلة"])
+    t1, t2, t4, t5, t6, t3 = st.tabs(["📚 البنك", "⬆️ رفع ومراجعة", "🏦 نقل إلى بنك قيّمني", "📄 نصوص القراءة",
+                                      "📘 شرح القواعد", "🎯 نمط الأسئلة"])
     with t1:
         _bank_tab(book, user, True, lang)
     with t2:
@@ -1357,5 +1412,7 @@ def render_ministry(book, flat_lessons, user, lang="ar", idx=None):
         _transfer_section(book, flat_lessons, user)
     with t5:
         _reading_section(book, flat_lessons, user, lang, idx)
+    with t6:
+        _grammar_section(book, flat_lessons, user, lang, idx)
     with t3:
         _style_section(book, user, lang)

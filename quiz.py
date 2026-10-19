@@ -189,7 +189,7 @@ def _generate_reference(client, idx, slug, lesson, qtype, asked_texts, style, la
             f"=== page {p['page'] - off} ===\n{sp.fix_ligatures(p['text'])}" for p in pages))
     schema = SPECS[qtype][1].replace('"page":12}', '"page":6,"quotes":[]}')
     asked = "\n".join(f"- {a}" for a in asked_texts) or ("none" if lang == "en" else "لا يوجد")
-    exercises = reading_texts.exercises_of(slug, lesson["title"])
+    exercises = (reading_texts.exercises_of(slug, lesson["title"]) + "\n\n" + companion.exercises_text(lesson, 3000)).strip()
     if lang == "ar":
         system, prompt = sp.SYSTEM_REFERENCE_AR, sp.reference_prompt_ar(lesson, "\n\n".join(blocks), qtype, asked, schema,
                                                                        style, exercises)

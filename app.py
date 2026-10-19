@@ -1,4 +1,5 @@
 import io
+import json
 import re
 import streamlit as st
 from PIL import Image
@@ -9,6 +10,7 @@ import accounts as acc
 import auth_ui
 import catalog
 import companion
+import explain_ctx
 import ingest
 import profile_ctx
 from config import GEMINI_MODEL
@@ -266,9 +268,10 @@ if acc.is_trial(user) and action in TRIAL_FEATURE_OF and acc.trial_remaining(use
 
 
 @st.cache_data(ttl=7 * 24 * 3600, max_entries=500, show_spinner=False)
-def cached_answer(book_key, topic, pages, request, _idx):
+def cached_answer(book_key, topic, pages, request, _idx, extras_json="", book_lang="ar"):
     ctx_pages = select_context(_idx, f"{topic} {request}".strip(), pages)
-    return answer(get_client(), request, ctx_pages), ctx_pages
+    extras = json.loads(extras_json) if extras_json else None
+    return answer(get_client(), request, ctx_pages, extras, book_lang), ctx_pages
 
 
 # ---------------------------------------------------------------- اشرح لي
@@ -290,6 +293,7 @@ if action in ("explain", "quiz"):
 if action == "explain":
     ALL_BOOK, WHOLE_UNIT = "كل الكتاب", "الوحدة كاملة"
     pages, topic, unit_name = None, "", ALL_BOOK
+    scope_titles = []          # دروس النطاق المختار (لجلب تمارين الأنشطة والأسئلة الوزارية وشرح القواعد)
     if units:
         unit_titles = [ALL_BOOK] + [u["title"] for u in units]
         unit_name = st.selectbox("الوحدة", unit_titles)
@@ -299,9 +303,11 @@ if action == "explain":
             lesson = st.selectbox("الدرس", lesson_titles)
             if lesson == WHOLE_UNIT:
                 pages, topic = (unit["start"], unit["end"]), unit_name
+                scope_titles = [x["title"] for x in unit["lessons"]]
             else:
                 l = unit["lessons"][lesson_titles.index(lesson) - 1]
                 pages, topic = (l["start"], l["end"]), lesson
+                scope_titles = [lesson]
             
             max_allowed_pages = 20
             page_count = pages[1] - pages[0] + 1
@@ -423,7 +429,12 @@ if action == "explain":
                             text, ctx_pages = response.text, []
                         else:
                             auth_ui.require_quota_or_stop(user)   # ملاحظة: يُحتسب لكل سؤال حر؛ راجع تعليق التكامل
-                            text, ctx_pages = cached_answer((grade, sem, slug, book["pdf_url"]), topic, pages, final_prompt, idx)
+                            extras, gblocks = explain_ctx.build(slug, idx, flat_lessons, scope_titles, user, lang)
+                            text, ctx_pages = cached_answer((grade, sem, slug, book["pdf_url"]), topic, pages, final_prompt, idx,
+                                                            json.dumps(extras, ensure_ascii=False, sort_keys=True), lang)
+                            for g in gblocks:                      # شرح القاعدة الخارجي يُدرَج حرفيًا مكان العلامة
+                                text = text.replace(f"<<GRAMMAR:{g['id']}>>", g["md"])
+                            text = re.sub(r"<<GRAMMAR:\d+>>", "", text)
 
                         st.markdown(text)
                         if ctx_pages:
