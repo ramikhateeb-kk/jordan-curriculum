@@ -2,24 +2,31 @@
 explain_ctx.py
 مواد «اشرح لي» الإضافية لدرس/وحدة محددة: تمارين الكتاب المرافق (الأنشطة)، والأسئلة الوزارية المعتمدة على الدرس، وشرح القواعد الخارجي.
 """
+import json
+import re
+
+import streamlit as st
+from google.genai import types
+
 import companion
 import grammar_ext
 import ministry
 import subject_profiles as sp
+from config import GEMINI_MODEL
+from rag import get_client
 
 WORKBOOK_MAX = 9000
 MAX_LESSONS = 6
 MAX_GRAMMAR = 2
 
 
-def build(slug, idx, flat_lessons, scope_titles, user, lang):
-    """يعيد (extras للنموذج، grammar_blocks للإدراج بعد الإجابة).
-    extras: {"workbook": نص، "ministry": نص، "grammar": [{"id","lesson"}]} — بلا نص الشرح الخارجي نفسه (يُدرَج حرفيًا بعد الإجابة).
-    الأسئلة الوزارية تُستعمل أمثلةً فقط إن كان بنكها مفتوحًا للمعلمين/الطلاب (أو كان المستخدم مديرًا/مشرفًا)."""
+def build(slug, idx, flat_lessons, scope_titles, user, lang, topic_en=None):
+    """مواد «اشرح لي» من المنهاج: تمارين كتاب الأنشطة والأسئلة الوزارية المعتمدة على الدروس. (شرح القواعد الخارجي لا يُدرَج هنا؛
+    يُعرض بعد الشرح من المنهاج عند طلب الطالب أو عند غياب الشرح في المنهاج.) topic_en = موضوع القاعدة المطلوبة إن وُجد."""
     lessons = [l for l in flat_lessons if l["title"] in set(scope_titles)][:MAX_LESSONS]
-    extras, blocks = {"workbook": "", "ministry": "", "grammar": []}, []
+    extras = {"workbook": "", "ministry": "", "grammar_topic": topic_en or ""}
     if not lessons:
-        return extras, blocks
+        return extras
     parts = []
     for l in lessons:
         t = companion.exercises_text(l, max_chars=3000)
@@ -31,13 +38,55 @@ def build(slug, idx, flat_lessons, scope_titles, user, lang):
             extras["ministry"] = ministry.examples_for_lessons(slug, [l["title"] for l in lessons], 6, lang)
     except Exception:  # noqa: BLE001
         pass
-    if lang == "en":
-        for l in lessons:
-            if len(blocks) >= MAX_GRAMMAR or sp.lesson_kind(l["title"]) not in grammar_ext.GRAMMAR_KINDS:
-                continue
-            row = grammar_ext.get_explanation(slug, l, idx)         # مخزَّن، أو يُولَّد مرة واحدة بالبحث ثم يُخزَّن
-            if row:
-                gid = len(blocks) + 1
-                blocks.append({"id": gid, "lesson": l["title"], "md": grammar_ext.render_md(row)})
-                extras["grammar"].append({"id": gid, "lesson": l["title"]})
-    return extras, blocks
+    return extras
+
+
+def external(slug, idx, flat_lessons, followup):
+    """الشرح المفصّل من مصادر خارجية لموضوع القاعدة: followup = {"kind":"topic","topic":...} أو {"kind":"lesson","lesson": عنوان}.
+    يعيد {content, sources} أو None. يُخزَّن ويُعاد استعماله."""
+    if followup.get("kind") == "topic":
+        return grammar_ext.get_topic_explanation(slug, followup["topic"], idx)
+    lesson = next((l for l in flat_lessons if l["title"] == followup.get("lesson")), None)
+    return grammar_ext.get_explanation(slug, lesson, idx) if lesson else None
+
+
+ROUTE_SYSTEM = (
+    "You route a student's question about an English textbook (the student may write in Arabic). Return JSON only: "
+    '{"keywords_en": "3-8 English keywords to find the relevant textbook pages (translate any Arabic term, e.g. '
+    'الماضي التام المستمر -> past perfect continuous)", "is_grammar": true/false (the student asks about an English grammar '
+    'rule, tense or structure), "topic_en": "the grammar topic name in English, e.g. Past Perfect Continuous, or null"}.')
+
+
+@st.cache_data(ttl=7 * 24 * 3600, max_entries=2000, show_spinner=False)
+def route(question):
+    """يحلّل سؤال الطالب (عربي أو إنجليزي): كلمات بحث إنجليزية للعثور على صفحات الكتاب، وهل هو سؤال قواعد وما اسم القاعدة.
+    يعيد {} عند الفشل (فيستمر النظام كما كان)."""
+    try:
+        r = get_client().models.generate_content(
+            model=GEMINI_MODEL, contents=f"Student question:\n{question[:600]}",
+            config=types.GenerateContentConfig(system_instruction=ROUTE_SYSTEM, temperature=0,
+                                                response_mime_type="application/json"))
+        d = json.loads(re.sub(r"^```(?:json)?|```$", "", (r.text or "").strip()).strip())
+    except Exception as e:  # noqa: BLE001
+        print("explain_ctx.route:", e)
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    topic = d.get("topic_en")
+    topic = str(topic).strip()[:80] if isinstance(topic, str) and topic.strip() and bool(d.get("is_grammar")) else None
+    return {"keywords_en": str(d.get("keywords_en") or "")[:120].strip(), "is_grammar": bool(d.get("is_grammar")) and bool(topic),
+            "topic_en": topic}
+
+
+def lessons_for_topic(idx, flat_lessons, query, limit=2):
+    """أنسب دروس الكتاب لموضوع (بالإنجليزية): عدد مرات ورود كلمات الموضوع في صفحات كل درس، مع ترجيح العنوان."""
+    words = {w for w in re.findall(r"[a-z]{4,}", query.lower())}
+    if not words:
+        return []
+    scored = []
+    for l in flat_lessons:
+        text = " ".join(p["text"].lower() for p in idx[0] if l["start"] <= p["page"] <= l["end"])
+        score = sum(text.count(w) for w in words) + 8 * sum(w in l["title"].lower() for w in words)
+        if score > 0:
+            scored.append((score, l["title"]))
+    return [t for _s, t in sorted(scored, key=lambda x: -x[0])[:limit]]

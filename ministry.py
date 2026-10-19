@@ -1333,7 +1333,7 @@ def _grammar_section(book, flat_lessons, user, lang, idx):
     row = rows.get(sel)
     if row:
         with st.container(border=True):
-            st.markdown(grammar_ext.render_md(row))
+            grammar_ext.show(row)
     else:
         st.info("لم يُولَّد شرح لهذا الدرس بعد (يُولَّد تلقائيًا عند أول طلب شرح، أو ولّده الآن).")
     if idx is not None and st.button("🔎 توليد / إعادة توليد الشرح بالبحث في الإنترنت", key=f"{k}_gen"):
@@ -1347,6 +1347,16 @@ def _grammar_section(book, flat_lessons, user, lang, idx):
         else:
             st.error("تعذّر إعداد الشرح. حاول مرة أخرى.")
     txt = st.text_area("تعديل الشرح (Markdown)", (row or {}).get("content") or "", height=320, key=f"{k}_txt")
+    topics = {t: v for t, v in rows.items() if t.startswith("topic:")}
+    if topics:
+        with st.expander(f"📚 شروح لمواضيع قواعد سأل عنها الطلاب ({len(topics)})"):
+            for t, v in topics.items():
+                st.markdown(f"**{v.get('title') or t[6:]}**")
+                grammar_ext.show(v)
+                if st.button("🗑️ حذف", key=f"gx_tdel_{slug}_{abs(hash(t)) % 10**8}"):
+                    grammar_ext.delete_row(slug, t)
+                    st.rerun()
+                st.divider()
     c1, c2 = st.columns(2)
     if c1.button("💾 حفظ كشرح معتمد", key=f"{k}_save", type="primary", disabled=not txt.strip()):
         grammar_ext.save_row(slug, sel, (row or {}).get("title"), txt.strip(), (row or {}).get("sources"), "manual", user["id"])

@@ -11,7 +11,9 @@ import auth_ui
 import catalog
 import companion
 import explain_ctx
+import grammar_ext
 import ingest
+import subject_profiles as sp
 import profile_ctx
 from config import GEMINI_MODEL
 from exam import render_exam_builder
@@ -331,7 +333,7 @@ if action == "explain":
         history.clear()
         st.rerun()
 
-    for msg in history:
+    for i, msg in enumerate(history):
         with st.chat_message(msg["role"]):
             if msg.get("image") is not None:
                 st.image(msg["image"], width=260)
@@ -343,6 +345,25 @@ if action == "explain":
                         st.write(p["text"])
             if msg.get("audio"):
                 st.audio(msg["audio"], format="audio/mp3")
+            if msg.get("ext_row"):                       # شرح مفصّل من مصادر خارجية (مع رسوم توضيحية)
+                st.divider()
+                st.markdown("#### 📚 شرح مفصّل من مصادر خارجية")
+                grammar_ext.show(msg["ext_row"])
+            if msg.get("followup_state") == "ask":       # سؤال قواعد أُجيب من المنهاج: هل يكفي؟
+                st.markdown("**هل كان الشرح كافيًا؟**")
+                b_yes, b_no = st.columns(2)
+                if b_yes.button("✅ نعم، كافٍ", key=f"fu_yes_{i}"):
+                    msg["followup_state"] = "done"
+                    st.rerun()
+                if b_no.button("❌ لا، أريد شرحًا أوسع", key=f"fu_no_{i}"):
+                    with st.spinner("جارٍ البحث في مصادر خارجية وإعداد شرح مفصّل مع الأمثلة والرسوم..."):
+                        ext = explain_ctx.external(slug, idx, flat_lessons, msg["followup"])
+                    msg["followup_state"] = "done"
+                    if ext:
+                        msg["ext_row"] = ext
+                    else:
+                        msg["content"] += "\n\n*(تعذّر الحصول على شرح من مصادر خارجية الآن. حاول مرة أخرى بعد قليل.)*"
+                    st.rerun()
 
     # ---- شريط الإدخال الموحّد: + (صورة/ملف نصي) | نص | 🎤 (تسجيل صوتي)
     prompt = st.chat_input(
@@ -354,6 +375,9 @@ if action == "explain":
     )
 
     if prompt:
+        for _m in history:
+            if _m.get("followup_state") == "ask":
+                _m["followup_state"] = "done"
         typed_text = (getattr(prompt, "text", "") or "").strip()
         files = list(getattr(prompt, "files", None) or [])
         audio_file = getattr(prompt, "audio", None)
@@ -429,14 +453,39 @@ if action == "explain":
                             text, ctx_pages = response.text, []
                         else:
                             auth_ui.require_quota_or_stop(user)   # ملاحظة: يُحتسب لكل سؤال حر؛ راجع تعليق التكامل
-                            extras, gblocks = explain_ctx.build(slug, idx, flat_lessons, scope_titles, user, lang)
-                            text, ctx_pages = cached_answer((grade, sem, slug, book["pdf_url"]), topic, pages, final_prompt, idx,
+                            q_topic, q_pages, q_scope, t_en, followup, ext_row = topic, pages, scope_titles, None, None, None
+                            if lang == "en":
+                                # كتاب إنجليزي: نحدد بالإنجليزية موضوع السؤال (وهل هو قاعدة) فنبحث عنه في الكتاب كله ولو كان
+                                # خارج الدرس المختار (مثال: سؤال عربي عن «الماضي التام المستمر» والدرس المختار من وحدة أخرى)
+                                route = explain_ctx.route(final_prompt)
+                                if route.get("keywords_en"):
+                                    q_topic = f"{topic} {route['keywords_en']}".strip()
+                                if route.get("is_grammar"):
+                                    t_en = route["topic_en"]
+                                    followup = {"kind": "topic", "topic": t_en}
+                                    if not any(t_en.lower() in t.lower() for t in scope_titles):
+                                        q_pages, q_topic = None, f"{t_en} {route.get('keywords_en', '')}".strip()
+                                        q_scope = explain_ctx.lessons_for_topic(idx, flat_lessons, q_topic)
+                                        st.caption(f"🔎 سؤال عن قاعدة «{t_en}»: بحثتُ عنها في المنهاج (الكتاب كله).")
+                                elif len(scope_titles) == 1 and sp.lesson_kind(scope_titles[0]) in grammar_ext.GRAMMAR_KINDS:
+                                    followup = {"kind": "lesson", "lesson": scope_titles[0]}
+                            extras = explain_ctx.build(slug, idx, flat_lessons, q_scope, user, lang, topic_en=t_en)
+                            text, ctx_pages = cached_answer((grade, sem, slug, book["pdf_url"]), q_topic, q_pages, final_prompt, idx,
                                                             json.dumps(extras, ensure_ascii=False, sort_keys=True), lang)
-                            for g in gblocks:                      # شرح القاعدة الخارجي يُدرَج حرفيًا مكان العلامة
-                                text = text.replace(f"<<GRAMMAR:{g['id']}>>", g["md"])
-                            text = re.sub(r"<<GRAMMAR:\d+>>", "", text)
+                            if "<<NOT_IN_CURRICULUM>>" in text:      # لا شرح لهذه القاعدة في المنهاج ← مصادر خارجية تلقائيًا
+                                text, ctx_pages = "لم أجد شرحًا لهذه القاعدة في المنهاج، فبحثتُ عنها في مصادر خارجية:", []
+                                with st.spinner("جارٍ البحث في مصادر خارجية وإعداد شرح مفصّل مع الأمثلة والرسوم..."):
+                                    ext_row = explain_ctx.external(slug, idx, flat_lessons,
+                                                                   followup or {"kind": "topic", "topic": final_prompt[:80]})
+                                if not ext_row:
+                                    text += "\n\n*(تعذّر الحصول على شرح من مصادر خارجية الآن. حاول مرة أخرى بعد قليل.)*"
+                                followup = None
 
                         st.markdown(text)
+                        if uploaded_image is None and ext_row:
+                            st.divider()
+                            st.markdown("#### 📚 شرح مفصّل من مصادر خارجية")
+                            grammar_ext.show(ext_row)
                         if ctx_pages:
                             with st.expander("صفحات الكتاب المستخدمة في الإجابة"):
                                 for p in ctx_pages:
@@ -450,9 +499,15 @@ if action == "explain":
                                 audio_bytes = audio_fp.getvalue()
                                 st.audio(audio_bytes, format="audio/mp3")
 
-                        history.append({"role": "assistant", "content": text,
-                                        "ctx_pages": ctx_pages, "audio": audio_bytes})
+                        entry = {"role": "assistant", "content": text, "ctx_pages": ctx_pages, "audio": audio_bytes}
+                        if uploaded_image is None and ext_row:
+                            entry["ext_row"] = ext_row
+                        if uploaded_image is None and followup:
+                            entry["followup"], entry["followup_state"] = followup, "ask"
+                        history.append(entry)
                         del history[:-10]   # نحتفظ بآخر 10 رسائل فقط لتوفير الذاكرة
+                        if entry.get("followup_state") == "ask":
+                            st.rerun()      # لتظهر أزرار «هل كان الشرح كافيًا؟» تحت الإجابة
                     except Exception as e:  # noqa: BLE001
                         st.error(f"حدث خطأ أثناء معالجة الطلب: {e}")
 

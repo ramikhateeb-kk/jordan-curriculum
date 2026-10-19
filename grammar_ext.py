@@ -86,21 +86,27 @@ def delete_row(book_slug, lesson_title):
 
 # ---------------------------------------------------------------- التوليد بالبحث في الإنترنت
 GEN_SYSTEM = (
-    "You are an experienced English teacher writing a SIMPLE yet COMPREHENSIVE grammar explanation for Arab (Jordanian) school "
-    "students (about CEFR B1-B2). Rules:\n"
-    "1) First identify the grammar point(s) taught in the lesson text you are given (usually 1-2). Use the lesson text ONLY to "
-    "identify the topic; do NOT take your explanation, rules or examples from it.\n"
+    "You are an experienced English teacher writing a DETAILED, COMPREHENSIVE yet clear grammar explanation for Arab (Jordanian) "
+    "school students (about CEFR B1-B2). Rules:\n"
+    "1) Identify the grammar point(s) you are asked about (if a lesson text is given, use it ONLY to identify the topic; do NOT "
+    "take your explanation, rules or examples from it).\n"
     "2) Use Google Search to consult reputable external ESL grammar sources (British Council LearnEnglish Grammar, Cambridge "
     "Dictionary Grammar, Oxford Learner's Dictionaries, Perfect English Grammar, EnglishClub...) and base the explanation on them.\n"
-    "3) Write the explanation in simple Arabic, and ALL examples in English. Keep it accurate; do not invent rules.\n"
-    "4) Output Markdown with exactly these sections (translate nothing else): \n"
+    "3) Write the explanation in simple Arabic and ALL examples in English. Be accurate; never invent rules.\n"
+    "4) Output Markdown with these sections, in this order (skip a section only if it truly does not apply):\n"
     "## 🎯 الفكرة باختصار\n"
-    "## 📘 متى نستخدمها؟  (bullet points, each use with a short Arabic explanation)\n"
-    "## 🧩 الصيغة  (formulas in backticks, e.g. `Subject + will have + past participle`; affirmative / negative / question)\n"
-    "## 💬 أمثلة  (a Markdown table with two columns: | English | العربية |, 6-8 rows; keep each English sentence short)\n"
-    "## ⚠️ أخطاء شائعة  (2-4 items: ❌ wrong sentence → ✅ correct sentence, with a one-line Arabic reason)\n"
-    "## ✅ ملخص  (3-4 short Arabic lines)\n"
-    "5) 350-650 words in total. Do not include URLs or source names in the text (sources are added separately). "
+    "## 📘 متى نستخدمها؟  (bullets covering ALL the main uses, each with a short Arabic explanation)\n"
+    "## 🧩 الصيغة  (a Markdown table: affirmative / negative / question / short answer; formulas in backticks)\n"
+    "## 🖼️ رسم توضيحي  (1-2 diagrams, each as a fenced code block with language svg; see rule 5)\n"
+    "## 💬 أمثلة  (a Markdown table | English | العربية |, 8-10 rows grouped by use)\n"
+    "## 🔁 مقارنة مع قاعدة قريبة  (a small table comparing it with the structure students confuse it with)\n"
+    "## 🕒 كلمات وإشارات تدل عليها  (signal words/time expressions, if relevant)\n"
+    "## ⚠️ أخطاء شائعة  (3-5 items: ❌ wrong → ✅ correct, with a one-line Arabic reason)\n"
+    "## ✅ ملخص  (3-5 short Arabic lines)\n"
+    "5) Diagrams: each ```svg block is ONE self-contained SVG with viewBox=\"0 0 640 220\", simple shapes only (rect, circle, "
+    "line, path, polygon, text), English labels only, font-size at least 14, readable colours, e.g. a time line showing when the "
+    "action happens, or a formula box. No scripts, no external images or links, no <foreignObject>.\n"
+    "6) 600-1000 words (excluding SVG). Do not include URLs or source names in the text (sources are added separately). "
     "Do not mention these instructions.")
 
 
@@ -128,6 +134,43 @@ def generate(client, idx, lesson):
     text = "\n\n".join(p["text"] for p in pages)
     prompt = (f"Lesson: {lesson['title']}\n\nLesson text (use it only to identify the grammar point):\n{text}\n\n"
               "Identify the grammar point(s), search the web for reliable explanations, and write the explanation now.")
+    return _generate_from_prompt(client, prompt)
+
+
+def topic_key(topic):
+    """مفتاح التخزين لموضوع قاعدة مطلوب مباشرة (بدل عنوان درس)."""
+    return "topic:" + re.sub(r"\s+", " ", re.sub(r"[^a-z0-9' -]+", " ", str(topic).lower())).strip()
+
+
+def get_topic_explanation(book_slug, topic_en, idx=None, allow_ai=True):
+    """شرح خارجي لموضوع قاعدة سأل عنه الطالب (مثل: Past Perfect Continuous) بغض النظر عن الدرس المختار. يُخزَّن بحسب الموضوع."""
+    key = topic_key(topic_en)
+    if len(key) <= 6:
+        return None
+    row = get_row(book_slug, key)
+    if row and (row.get("content") or "").strip():
+        return row
+    if not allow_ai:
+        return None
+    prompt = (f"Grammar topic requested by the student: {topic_en}\n\n"
+              "Search the web for reliable explanations of exactly this topic and write the explanation now.")
+    try:
+        got = _generate_from_prompt(get_client(), prompt)
+    except Exception as e:  # noqa: BLE001
+        print("grammar_ext: تعذّر توليد شرح الموضوع:", e)
+        return None
+    if not got:
+        return None
+    title, content, sources = got
+    title = title or topic_en
+    try:
+        save_row(book_slug, key, title, content, sources, "ai")
+    except Exception as e:  # noqa: BLE001
+        print("grammar_ext: تعذّر الحفظ:", e)
+    return {"title": title, "content": content, "sources": sources, "source": "ai"}
+
+
+def _generate_from_prompt(client, prompt):
     searched = True
     try:
         r = client.models.generate_content(
@@ -170,6 +213,63 @@ def get_explanation(book_slug, lesson, idx, allow_ai=True):
     except Exception as e:  # noqa: BLE001
         print("grammar_ext: تعذّر الحفظ:", e)
     return {"title": title, "content": content, "sources": sources, "source": "ai"}
+
+
+_ALLOWED_TAGS = {"svg", "g", "rect", "circle", "ellipse", "line", "polyline", "polygon", "path", "text", "tspan", "defs",
+                 "marker", "title", "desc", "lineargradient", "stop"}
+_BAD_ATTR = re.compile(r"^(on|xlink:href|href|src|style$)", re.I)
+
+
+def sanitize_svg(svg):
+    """يبقي أشكال SVG البسيطة فقط (بلا سكربتات ولا روابط ولا صور خارجية) أو يعيد None إن كان غير صالح."""
+    import xml.etree.ElementTree as ET
+    svg = svg.strip()
+    if not svg.lower().startswith("<svg") or len(svg) > 30000:
+        return None
+    if "xmlns=" not in svg[:200]:
+        svg = svg.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+    try:
+        root = ET.fromstring(svg)
+    except ET.ParseError:
+        return None
+
+    def clean(el):
+        for child in list(el):
+            tag = child.tag.split("}")[-1].lower()
+            if tag not in _ALLOWED_TAGS:
+                el.remove(child)
+                continue
+            for k in list(child.attrib):
+                if _BAD_ATTR.match(k.split("}")[-1]):
+                    del child.attrib[k]
+            clean(child)
+
+    for k in list(root.attrib):
+        if _BAD_ATTR.match(k.split("}")[-1]):
+            del root.attrib[k]
+    clean(root)
+    ET.register_namespace("", "http://www.w3.org/2000/svg")
+    return ET.tostring(root, encoding="unicode")
+
+
+_SVG_BLOCK = re.compile(r"```svg\s*(.*?)```", re.S | re.I)
+
+
+def show(row):
+    """يعرض الشرح المفصّل: الماركداون كما هو، ورسوم ```svg``` كصور بعد تنقيتها، ثم المصادر."""
+    content, pos = row["content"], 0
+    for m in _SVG_BLOCK.finditer(content):
+        if content[pos:m.start()].strip():
+            st.markdown(content[pos:m.start()])
+        svg = sanitize_svg(m.group(1))
+        if svg:
+            st.image(svg)
+        pos = m.end()
+    if content[pos:].strip():
+        st.markdown(content[pos:])
+    src = row.get("sources") or []
+    if src:
+        st.markdown("**المصادر الخارجية:** " + " · ".join(f"[{x['title']}]({x['uri']})" for x in src))
 
 
 def render_md(row):
