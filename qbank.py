@@ -1,12 +1,14 @@
-"""
-qbank.py - إدارة بنك الأسئلة المنهجية
-"""
+# -*- coding: utf-8 -*-
+"""qbank.py - إدارة بنك الأسئلة للمناهج الأردنية"""
+from typing import List, Dict, Any
 
-def get_questions_for_lesson(grade: str, subject: str, unit: int):
+def get_questions_for_subject(grade: str, subject: str, unit: int = 1) -> List[Dict[str, Any]]:
     return [
         {
             "id": 1,
-            "question": "ما الفرق بين المفهوم النظري والتطبيق العملي في هذا الدرس؟",
-            "answer": "المفهوم النظري يحدد القاعدة، بينما التطبيق يوضح استخدامها في المسائل اليومية."
+            "question": f"سؤال نموذجي لمادة {subject} - {grade}",
+            "options": ["الخيار الأول", "الخيار الثاني", "الخيار الثالث", "الخيار الرابع"],
+            "correct_index": 0,
+            "explanation": "الشرح المعتمد وفق منهاج وزارة التربية والتعليم الأردنية."
         }
     ]

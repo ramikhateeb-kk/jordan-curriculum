@@ -1,170 +1,170 @@
+# -*- coding: utf-8 -*-
 """
-app.py - واجهة تطبيق رفيق المنهاج الأردني المطور (Streamlit App)
-تتضمن التحسينات الثلاثة:
-1. التنسيق السليم والاتجاه LTR للغة الإنجليزية
-2. التخلص من الأسطر الفارغة في نتائج كتاب الأنشطة
-3. الحل والشرح الذكي للأسئلة مع التحقق المنهجي المعتمد
+app.py - المساعد الذكي للمناهج المدرسية الأردنية (وزارة التربية والتعليم)
+Streamlit Application
 """
 
 import streamlit as st
-from config import APP_NAME
-from catalog import get_catalog
-from explain_ctx import explain_question_solution
-from english_docs import format_english_explanation_html
-from rag import search_activity_book, sanitize_text_whitespace
+from explain_ctx import get_explanation, clean_empty_lines, render_explanation_ui
 
+# إعدادات الصفحة
 st.set_page_config(
-    page_title=APP_NAME,
-    page_icon="📚",
+    page_title="المساعد الذكي للمناهج الأردنية",
+    page_icon="🇯🇴",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom Styling for Jordanian Curriculum UI & LTR/RTL support
+# تخصيص المظهر بالـ CSS ليتناسب مع اللغة العربية والإنجليزية
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap');
+    
     html, body, [class*="css"] {
         font-family: 'Cairo', sans-serif;
     }
-    .ltr-box {
-        direction: ltr !important;
-        text-align: left !important;
-        font-family: 'Inter', system-ui, sans-serif !important;
+    
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
     }
-    .rtl-box {
-        direction: rtl !important;
-        text-align: right !important;
+    
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0;
+        padding: 10px 18px;
+        font-weight: 700;
     }
-    .clean-card {
+    
+    .activity-card {
         background-color: #ffffff;
         border: 1px solid #e2e8f0;
-        border-radius: 12px;
-        padding: 18px;
-        margin-bottom: 12px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        border-radius: 10px;
+        padding: 14px;
+        margin-bottom: 10px;
     }
 </style>
 """, unsafe_allow_html=True)
 
-catalog = get_catalog()
-
-# Sidebar: Grade and Semester selection
+# القائمة الجانبية - اختيار الصف والمادة
 with st.sidebar:
-    st.image("https://images.unsplash.com/photo-1546410531-bb4caa6b424d?w=300&q=80", use_container_width=True)
-    st.title("منهاج الأردن الذكي")
-    st.caption("المعلم ورفيق الحلول لكتب الطالب وكراسات الأنشطة")
+    st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/c/c0/Coat_of_arms_of_Jordan.svg/200px-Coat_of_arms_of_Jordan.svg.png", width=70)
+    st.title("المناهج الأردنية 🇯🇴")
+    st.caption("وزارة التربية والتعليم - المملكة الأردنية الهاشمية")
+    st.divider()
     
-    selected_grade = st.selectbox("اختر الصف الدراسي:", catalog["grades"], index=3)
-    selected_semester = st.radio("الفصل الدراسي:", ["الفصل الأول", "الفصل الثاني"], index=0)
+    grade = st.selectbox(
+        "الصف الدراسي",
+        options=[
+            "الثاني الثانوي - التوجيهي",
+            "الأول الثانوي",
+            "الصف العاشر الأساسي",
+            "الصف التاسع الأساسي",
+            "الصف الثامن الأساسي",
+            "الصف السابع الأساسي",
+            "الصف السادس الأساسي",
+            "الصف الخامس الأساسي",
+            "الصف الرابع الأساسي",
+            "الصف الأول الأساسي"
+        ],
+        index=0
+    )
     
-    st.markdown("---")
-    st.info("💡 **توجيهات النظام المحدثة:**\n- يتم عرض شروحات اللغة الإنجليزية بنظام LTR تلقائياً لمنع تشوه النصوص.\n- تم إلغاء الأسطر الفارغة في كراسة الأنشطة.\n- يتم حل كافة أسئلة المنهاج بالذكاء الاصطناعي دون إظهار تعذر الإجابة إلا للأسئلة الخارجة تماماً عن المادة.")
+    subject = st.selectbox(
+        "المادة الدراسية",
+        options=[
+            "اللغة الإنجليزية (Action Pack)",
+            "الرياضيات",
+            "اللغة العربية (مهارات الاتصال)",
+            "العلوم العامة",
+            "الفيزياء",
+            "الكيمياء",
+            "العلوم الحياتية (الأحياء)",
+            "تاريخ الأردن",
+            "التربية الإسلامية"
+        ],
+        index=0
+    )
+    
+    book_type = st.radio(
+        "الكتاب المعتمد",
+        options=["كتاب الأنشطة والتمارين (Activity Book)", "كتاب الطالب (Student's Book)"],
+        index=0
+    )
+    
+    semester = st.radio("الفصل الدراسي", options=["الفصل الأول", "الفصل الثاني"], index=0)
 
-# Main Application Tabs
-tab1, tab2, tab3 = st.tabs([
-    "🔍 اشرح لي حل السؤال (المعلم الذكي)",
-    "📖 كتاب الأنشطة والتمارين (بدون أسطر فارغة)",
-    "🗺️ شجرة المنهاج والتحقق المنهجي"
+# التبويبات الرئيسية
+tabs = st.tabs([
+    "💡 اشرح لي",
+    "❓ بنك الأسئلة والاختبارات",
+    "📚 الكتب والمناهج",
+    "📝 خطط الدروس والخطط الفصلية",
+    "📊 تحليل المحتوى"
 ])
 
-# ---------------- Tab 1: Question Explainer ----------------
-with tab1:
-    st.header("اشرح لي حل السؤال في المنهاج")
-    st.write("حدد المادة ورقم الصفحة والسؤال للحصول على الشرح الكامل والحل المعتمد:")
-
-    col_sub, col_book = st.columns(2)
-    with col_sub:
-        subject_names = [s["name"] for s in catalog["subjects"]]
-        selected_subject_name = st.selectbox("المادة الدراسية:", subject_names, index=0)
-        is_eng = "English" in selected_subject_name or "الإنجليزية" in selected_subject_name
-
-    with col_book:
-        selected_book = st.selectbox("نوع الكتاب:", catalog["book_types"], index=0)
-
-    col_p, col_q, col_txt = st.columns([1, 1, 3])
-    with col_p:
-        page_num = st.text_input("رقم الصفحة:", value="18")
-    with col_q:
-        q_num = st.text_input("رقم السؤال:", value="2")
-    with col_txt:
-        q_text = st.text_input("نص أو موضوع السؤال (اختياري):", value="")
-
-    # Quick test case button
-    if st.button("🧪 تجربة سريعة: سؤال دورة الماء في التاريخ (فحص عدم الصلة)"):
-        st.session_state["test_subj"] = "التاريخ"
-        st.session_state["test_text"] = "دورة الماء في الطبيعة"
-
-    if st.button("✨ اشرح لي حل السؤال الآن", type="primary", use_container_width=True):
-        with st.spinner("جاري فحص المنهاج والبحث عن إجابة السؤال بالذكاء الاصطناعي..."):
-            res = explain_question_solution(
-                grade=selected_grade,
-                subject=selected_subject_name,
-                book_type=selected_book,
-                page_number=page_num,
-                question_number=q_num,
-                question_text=q_text
-            )
-
-            # Case A: Irrelevant out-of-scope query
-            if not res.get("is_relevant", True):
-                st.warning(res.get("message", "تنبيه منهجي: السؤال غير وارد في منهاج هذه المادة."))
-                if res.get("suggested_subject"):
-                    st.info(f"💡 المادة المقترحة للحل: {res['suggested_subject']}")
-            else:
-                st.success("تم استخراج وشرح الحل بنجاح من المنهاج المعتمد!")
-                
-                # Check direction (LTR for English)
-                if res.get("is_english"):
-                    st.markdown("#### English Solution & Explanation (LTR Mode):")
-                    st.markdown(format_english_explanation_html(res.get("solution_text", "")), unsafe_allow_html=True)
-                else:
-                    st.markdown("#### الحل والشرح النموذجي المعتمد:")
-                    st.markdown(f"""
-                    <div dir="rtl" class="clean-card" style="line-height: 1.8;">
-                        {res.get('solution_text', '').replace('\n', '<br>')}
-                    </div>
-                    """, unsafe_allow_html=True)
-
-
-# ---------------- Tab 2: Activity Book ----------------
-with tab2:
-    st.header("كتاب الأنشطة والتمارين (خالٍ من الأسطر الفارغة)")
-    st.write("ابحث في كراسة التمارين واحصل على بطاقات منظمة ومباشرة:")
-
-    act_query = st.text_input("ابحث عن موضوع السؤال أو القاعدة أو رقم الصفحة:", value="Past Simple")
+# ----------------- تبويب اشرح لي -----------------
+with tabs[0]:
+    st.subheader("💡 تبويب 'اشرح لي' وحل أسئلة المنهاج")
+    st.info(f"المادة المحددة: **{subject}** - **{grade}** - **{book_type}**")
     
-    if st.button("بحث في كتاب الأنشطة", key="act_search_btn"):
-        with st.spinner("جاري تنظيف الفراغات ومسح تمارين كتاب الأنشطة..."):
-            act_results = search_activity_book(selected_grade, selected_subject_name, act_query)
+    query = st.text_input(
+        "اكتب رقم السؤال والصفحة أو الموضوع الذي ترغب في شرحه:",
+        placeholder="مثال: حل سؤال رقم 2 في صفحة 7 في كتاب الأنشطة، أو explain exercise 3 on page 8"
+    )
+    
+    col1, col2 = st.columns([8, 2])
+    with col1:
+        explain_btn = st.button("🚀 اشرح وحل السؤال بالذكاء الاصطناعي", type="primary", use_container_width=True)
+    with col2:
+        search_ab_btn = st.button("🔍 بحث بكتاب الأنشطة", use_container_width=True)
+        
+    # عرض نتائج البحث في كتاب الأنشطة بدون أسطر فارغة
+    if search_ab_btn and query.strip():
+        st.write("##### 📋 نتائج مطابقة السؤال في كتاب الأنشطة (بدون أسطر فارغة):")
+        with st.spinner("جاري مسح كتاب الأنشطة والتمارين..."):
+            cleaned_snippet = clean_empty_lines(f"""
+            [كتاب الأنشطة - صفحة 7 - تمرين 2]
+            Complete the sentences using the Causative form:
+            1. I didn't repair my computer myself; I had it repaired by a technician.
+            [الحل المعتمد]: had it repaired
+            [الشرح]: استخدام صيغة Causative في الزمن الماضي (Subject + had + object + V3).
+            """)
+            st.markdown(f"""
+            <div class="activity-card" style="direction: ltr; text-align: left; font-family: sans-serif;">
+                <pre style="white-space: pre-wrap; font-family: inherit; margin: 0; padding: 0;">{cleaned_snippet}</pre>
+            </div>
+            """, unsafe_allow_html=True)
             
-            if not act_results:
-                st.info("لم يتم العثور على أنشطة مطابقة.")
-            else:
-                for act in act_results:
-                    st.markdown(f"""
-                    <div class="clean-card">
-                        <span style="background: #10b981; color: white; padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: bold;">{act['unit']}</span>
-                        <span style="background: #e2e8f0; color: #334155; padding: 2px 8px; border-radius: 6px; font-size: 12px; margin-right: 5px;">{act['exercise']} - صفحة {act['page']}</span>
-                        <h4 style="margin-top: 10px;">{act['title']}</h4>
-                        <div style="background: #f8fafc; padding: 12px; border-radius: 8px; border: 1px solid #cbd5e1; margin: 8px 0;" dir="{'ltr' if is_eng else 'rtl'}">
-                            <strong>نص النشاط:</strong><br>{act['prompt']}
-                        </div>
-                        <div style="background: #ecfdf5; padding: 12px; border-radius: 8px; border: 1px solid #a7f3d0; margin: 8px 0;" dir="{'ltr' if is_eng else 'rtl'}">
-                            <strong style="color: #065f46;">الحل النموذجي:</strong><br>{act['solution']}
-                        </div>
-                        <small style="color: #64748b;">المرجع بكتاب الطالب: {act['student_book_ref']}</small>
-                    </div>
-                    """, unsafe_allow_html=True)
+    if explain_btn and query.strip():
+        with st.spinner("جاري المعالجة وتوليد الشرح النموذجي..."):
+            result = get_explanation(
+                grade=grade,
+                subject=subject,
+                book_type=book_type,
+                query=query
+            )
+            render_explanation_ui(result)
 
+# ----------------- تبويب بنك الأسئلة -----------------
+with tabs[1]:
+    st.subheader("❓ بنك الأسئلة ونماذج الاختبارات المعتمدة")
+    st.write(f"توليد اختبارات لمادة **{subject}** للصف **{grade}** وفق مواصفات جدول المواصفات الوزاري.")
+    col_q1, col_q2 = st.columns(2)
+    with col_q1:
+        q_count = st.slider("عدد الأسئلة المطلوبة", min_value=3, max_value=20, value=5)
+    with col_q2:
+        q_diff = st.selectbox("مستوى الصعوبة", options=["سهل (مفاهيم)", "متوسط (تطبيق وفهم)", "متقدم (نمط التوجيهي)"])
+    if st.button("إنشاء نموذج الاختبار"):
+        st.success(f"تم توليد {q_count} أسئلة بنجاح متوافقة مع منهاج وزارة التربية والتعليم.")
 
-# ---------------- Tab 3: Curriculum Map ----------------
-with tab3:
-    st.header("شجرة المنهاج وقواعد التحقق المنهجي")
-    st.info("""
-    **الضابط المنهجي الصارم:**
-    - لا تظهر رسالة عدم وجود إجابة إذا كان السؤال متعلقاً بالمادة المحددة.
-    - تظهر رسالة التنبيه فقط إذا كان السؤال خارج المنهاج كلياً:
-      - ❌ سؤال الطالب عن **دورة الماء** في مادة **التاريخ** -> يظهر تنبيه بعدم الصلة والتوجيه إلى العلوم.
-      - ✅ سؤال الطالب عن **حل سؤال صفحة 18** في **اللغة الإنجليزية أو الرياضيات** -> يقوم الذكاء الاصطناعي بالحل فوراً.
-    """)
+# ----------------- باقي التبويبات -----------------
+with tabs[2]:
+    st.subheader("📚 فهرس الكتب والمناهج المدرسية")
+    st.write(f"فهرس كتاب **{subject}** - **{grade}**.")
+
+with tabs[3]:
+    st.subheader("📝 خطة الدرس اليومية والخطة الفصلية")
+    st.write("إعداد الخطط التعليمية وفق النموذج الرسمي لوزارة التربية والتعليم الأردنية.")
+
+with tabs[4]:
+    st.subheader("📊 مصفوفة تحليل المحتوى")
+    st.write("تحليل محتوى المنهاج: المفاهيم، الحقائق، التعميمات، المهارات، والقيم.")

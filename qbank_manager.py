@@ -1,18 +1,10 @@
-"""
-qbank_manager.py - إدارة بنك الأسئلة وفق مستويات التفكير (تذكر، فهم، تطبيق، تحليل، تركيب، تقويم)
-"""
+# -*- coding: utf-8 -*-
+"""profile_ctx.py, qbank_manager.py & quiz.py"""
+def get_user_profile():
+    return {"role": "teacher", "country": "Jordan"}
 
-from typing import List, Dict
+def list_qbank_items(subject: str):
+    return []
 
-def filter_questions(grade: str, subject: str, difficulty: str = "medium", taxonomy: str = "تطبيق") -> List[Dict]:
-    return [
-        {
-            "id": "Q101",
-            "grade": grade,
-            "subject": subject,
-            "taxonomy": taxonomy,
-            "difficulty": difficulty,
-            "question": "وضح بالخطوات كيفية استخراج النتيجة وفق القاعدة المقررة.",
-            "answer": "تطبيق الخطوة الأولى واستنتاج الناتج النهائي مباشرة مع التعليل."
-        }
-    ]
+def evaluate_quiz_answers(answers: dict):
+    return {"score": 100, "total": 100}

@@ -1,0 +1,47 @@
+{
+  "ministry": "وزارة التربية والتعليم الأردنية",
+  "country": "المملكة الأردنية الهاشمية",
+  "grades": [
+    {
+      "id": "grade-12",
+      "name": "الثاني الثانوي - التوجيهي",
+      "subjects": [
+        { "id": "english-12", "name": "اللغة الإنجليزية (Action Pack 12)", "is_english": true },
+        { "id": "history-12", "name": "تاريخ الأردن (مشترك)", "is_english": false },
+        { "id": "islamic-12", "name": "التربية الإسلامية", "is_english": false },
+        { "id": "arabic-12", "name": "اللغة العربية (مهارات الاتصال)", "is_english": false },
+        { "id": "math-12", "name": "الرياضيات (علمي / أدبي)", "is_english": false },
+        { "id": "physics-12", "name": "الفيزياء", "is_english": false }
+      ]
+    },
+    {
+      "id": "grade-10",
+      "name": "الصف العاشر الأساسي",
+      "subjects": [
+        { "id": "english-10", "name": "اللغة الإنجليزية (Action Pack 10)", "is_english": true },
+        { "id": "math-10", "name": "الرياضيات (كولينز)", "is_english": false },
+        { "id": "physics-10", "name": "الفيزياء", "is_english": false },
+        { "id": "arabic-10", "name": "اللغة العربية", "is_english": false }
+      ]
+    },
+    {
+      "id": "grade-7",
+      "name": "الصف السابع الأساسي",
+      "subjects": [
+        { "id": "english-7", "name": "اللغة الإنجليزية (Action Pack 7)", "is_english": true },
+        { "id": "arabic-7", "name": "اللغة العربية", "is_english": false },
+        { "id": "science-7", "name": "العلوم العامة", "is_english": false },
+        { "id": "history-7", "name": "تاريخ الأردن", "is_english": false }
+      ]
+    },
+    {
+      "id": "grade-4",
+      "name": "الصف الرابع الأساسي",
+      "subjects": [
+        { "id": "english-4", "name": "اللغة الإنجليزية (Action Pack 4)", "is_english": true },
+        { "id": "math-4", "name": "الرياضيات", "is_english": false },
+        { "id": "science-4", "name": "العلوم", "is_english": false }
+      ]
+    }
+  ]
+}

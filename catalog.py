@@ -1,36 +1,27 @@
-"""
-catalog.py - فهرس كتب ومواد المنهاج الأردني المطور لكافة الصفوف
-"""
+# -*- coding: utf-8 -*-
+import json
+import os
+from typing import Dict, Any, List
 
-JORDAN_CURRICULUM_CATALOG = {
-    "grades": [
-        "الصف الأول الأساسي",
-        "الصف الثاني الأساسي",
-        "الصف الثالث الأساسي",
-        "الصف الرابع الأساسي",
-        "الصف الخامس الأساسي",
-        "الصف السادس الأساسي",
-        "الصف السابع الأساسي",
-        "الصف الثامن الأساسي",
-        "الصف التاسع الأساسي",
-        "الصف العاشر الأساسي",
-        "الأول ثانوي (الحادي عشر)",
-        "الثاني ثانوي (التوجيهي)"
-    ],
-    "subjects": [
-        {"id": "english", "name": "اللغة الإنجليزية (Action Pack)", "is_english": True},
-        {"id": "math", "name": "الرياضيات", "is_english": False},
-        {"id": "science", "name": "العلوم العامة المطورة", "is_english": False},
-        {"id": "history", "name": "التاريخ", "is_english": False},
-        {"id": "geography", "name": "الجغرافيا", "is_english": False},
-        {"id": "arabic", "name": "اللغة العربية", "is_english": False},
-        {"id": "islamic", "name": "التربية الإسلامية", "is_english": False}
-    ],
-    "book_types": [
-        "كتاب الطالب (Student Book)",
-        "كتاب الأنشطة والتمارين (Activity Book)"
+CATALOG_PATH = os.path.join(os.path.dirname(__file__), "data", "catalog.json")
+
+def load_catalog() -> Dict[str, Any]:
+    if os.path.exists(CATALOG_PATH):
+        with open(CATALOG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"grades": []}
+
+def get_subjects_for_grade(grade_name: str) -> List[str]:
+    cat = load_catalog()
+    for g in cat.get("grades", []):
+        if g.get("name") == grade_name:
+            return [s.get("name") for s in g.get("subjects", [])]
+    return [
+        "اللغة الإنجليزية (Action Pack)",
+        "الرياضيات",
+        "اللغة العربية (مهارات الاتصال)",
+        "العلوم العامة",
+        "الفيزياء",
+        "تاريخ الأردن",
+        "التربية الإسلامية"
     ]
-}
-
-def get_catalog():
-    return JORDAN_CURRICULUM_CATALOG

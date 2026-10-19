@@ -1,0 +1,6 @@
+{
+  "name": "المساعد الذكي للمناهج الأردنية",
+  "description": "منصة تعليمية ذكية للمناهج المدرسية الأردنية توفر شرح الدروس وحل أسئلة الكتب وبنك الأسئلة وإعداد الخطط الدراسية.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

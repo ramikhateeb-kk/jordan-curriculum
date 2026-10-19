@@ -1,8 +1,9 @@
-"""
-companion.py - المساعد الذكي لمرافقة الطالب في حل الواجبات
-"""
+# -*- coding: utf-8 -*-
+"""companion.py & teacher_help.py - رفيق المعلم الذكي والمساعد التعليمي"""
 
-from explain_ctx import explain_question_solution
-
-def ask_companion(grade: str, subject: str, book_type: str, page: str, question: str, text: str = ""):
-    return explain_question_solution(grade, subject, book_type, page, question, text)
+def get_teacher_tips(grade: str, subject: str) -> list:
+    return [
+        "مراعاة الفروق الفردية في الأنشطة الصفية.",
+        "استخدام أسلوب الحوار والمناقشة لترسيخ المفاهيم.",
+        "التركيز على نتاجات التعلم الخاصة بكل درس في المنهاج الأردني."
+    ]

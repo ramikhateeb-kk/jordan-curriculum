@@ -1,16 +1,12 @@
-"""
-word_rtl.py - معالجة اتجاه النصوص والتصدير لملفات Word / PDF
-مع الفصل التام بين اتجاه اللغة الإنجليزية LTR واللغة العربية RTL
-"""
+# -*- coding: utf-8 -*-
+"""word_rtl.py - أدوات ضبط اتجاه النصوص العربية والإنجليزية وملفات Word"""
 
-def wrap_text_direction(text: str, is_english: bool = False) -> str:
-    """
-    تغليف النص باتجاه صحيح بحيث لا تنقلب الجمل الإنجليزية
-    """
-    if is_english:
-        return f"\u202A{text}\u202C"  # LTR embedding
-    return f"\u202B{text}\u202C"  # RTL embedding
+def set_cell_direction(cell, is_english: bool = False):
+    """ضبط اتجاه الخلية LTR للإنجليزية أو RTL للعربية"""
+    direction = "ltr" if is_english else "rtl"
+    align = "left" if is_english else "right"
+    return {"direction": direction, "align": align}
 
-def clean_arabic_english_mix(text: str) -> str:
-    # يمنع اختلاط علامات الترقيم الإنجليزية بالنصوص العربية
-    return text.replace("?", "؟") if not any(c in text for c in "abcdefghijklmnopqrstuvwxyz") else text
+def format_bilingual_paragraph(ar_text: str, en_text: str) -> str:
+    """تنسيق فقرة ثنائية اللغة بدون تداخل علامات الترقيم"""
+    return f"{ar_text.strip()}\n{en_text.strip()}"

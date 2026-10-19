@@ -1,11 +1,4 @@
-"""
-slides.py - توليد الشرائح والعروض التقديمية للغرفة الصفية
-"""
-
-def generate_lesson_slides(title: str, objectives: list, steps: list, summary: str):
-    return [
-        {"slide": 1, "title": title, "content": "مرحباً بكم في درس اليوم - المنهاج الأردني"},
-        {"slide": 2, "title": "أهداف التعلم", "bullets": objectives},
-        {"slide": 3, "title": "الشرح والمفاهيم", "bullets": steps},
-        {"slide": 4, "title": "الخلاصة والتكليف البيتي", "content": summary}
-    ]
+# -*- coding: utf-8 -*-
+"""slides.py - عروض تقديمية للدروس"""
+def generate_slides(grade: str, subject: str, lesson_title: str):
+    return [{"slide": 1, "title": lesson_title, "content": "مقدمة الدرس ونتاجات التعلم"}]

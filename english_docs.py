@@ -1,42 +1,12 @@
-"""
-english_docs.py - أدوات تنسيق ومعالجة وثائق ومناهج اللغة الإنجليزية
-يضمن عرض الشرح بتنسيق LTR صحيح دون قلب الكلمات أو تشويه علامات الترقيم
-"""
+# -*- coding: utf-8 -*-
+"""english_docs.py & grammar_ext.py - مستندات وقواعد منهاج Action Pack الأردني"""
 
-import re
+ACTION_PACK_GRAMMAR = {
+    "Grade 12": ["Tenses Revision", "Reported Speech", "Passive Voice", "Causative Verbs", "Used to vs Be used to"],
+    "Grade 10": ["Present Simple & Continuous", "Stative Verbs", "Past Simple & Continuous", "Passive Voice"],
+    "Grade 7": ["Present Simple & Continuous", "Personality Adjectives", "Past Continuous with while/when"],
+    "Grade 4": ["Going to (Future)", "Must / Mustn't", "Past Simple Regular Verbs"]
+}
 
-def format_english_explanation_html(text: str) -> str:
-    """
-    تنسيق نصوص الشرح الإنجليزية داخل حاوية LTR واضحة مع خط لاتيني مناسب
-    """
-    clean = re.sub(r'\n{3,}', '\n\n', text).strip()
-    
-    html = f"""
-    <div dir="ltr" style="
-        text-align: left;
-        font-family: 'Inter', system-ui, -apple-system, sans-serif;
-        line-height: 1.7;
-        direction: ltr;
-        background-color: #f8fafc;
-        border-radius: 12px;
-        padding: 16px 20px;
-        border: 1px solid #e2e8f0;
-        color: #1e293b;
-        margin: 10px 0;
-    ">
-        <div style="white-space: pre-line; font-size: 15px;">
-            {clean}
-        </div>
-    </div>
-    """
-    return html
-
-def is_english_content(text: str) -> bool:
-    """
-    فحص ما إذا كان النص يحتوي على نسبة غالبة من الأحرف الإنجليزية
-    """
-    if not text:
-        return False
-    english_chars = len(re.findall(r'[a-zA-Z]', text))
-    arabic_chars = len(re.findall(r'[\u0600-\u06FF]', text))
-    return english_chars > arabic_chars
+def get_grammar_summary(grade: str) -> list:
+    return ACTION_PACK_GRAMMAR.get(grade, ["General Action Pack Grammar Rules"])
