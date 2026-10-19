@@ -1,25 +1,24 @@
 """
-file_store.py
-رفع ملفات (Word / PowerPoint ...) إلى Supabase Storage وإرجاع رابط تحميل عام مباشر.
-يستخدم نفس مفاتيح catalog (SUPABASE_URL / SUPABASE_KEY) عبر REST دون أي مكتبة إضافية.
+file_store.py - تخزين واسترجاع الملفات والمستندات التعليمية محلياً وسحابياً
 """
-from urllib.parse import quote
 
-import requests
+import os
+import shutil
 
-import catalog
+BASE_DIR = os.path.dirname(__file__)
+UPLOADS_DIR = os.path.join(BASE_DIR, "data", "uploads")
+EXPORTS_DIR = os.path.join(BASE_DIR, "data", "exports")
 
-BUCKET = "teacher-files"   # Bucket عام في Supabase Storage
-TIMEOUT = 30
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+os.makedirs(EXPORTS_DIR, exist_ok=True)
 
+def save_uploaded_file(uploaded_file, category: str = "general") -> str:
+    target_dir = os.path.join(UPLOADS_DIR, category)
+    os.makedirs(target_dir, exist_ok=True)
+    file_path = os.path.join(target_dir, uploaded_file.name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer() if hasattr(uploaded_file, "getbuffer") else uploaded_file.read())
+    return file_path
 
-def upload_file(path, data, mime, download_name):
-    """يرفع bytes إلى BUCKET/path ويعيد رابطًا عامًا يُنزِّل الملف باسم download_name."""
-    url, h = catalog._sb()
-    headers = {"apikey": h["apikey"], "Authorization": h["Authorization"], "Content-Type": mime}
-    r = requests.post(f"{url}/storage/v1/object/{BUCKET}/{path}",
-                      headers=headers, data=data, timeout=TIMEOUT)
-    # 409 = الملف نفسه مرفوع سابقًا (المسار يتضمن بصمة المحتوى) → نعتبره نجاحًا
-    if not r.ok and r.status_code != 409 and "Duplicate" not in r.text:
-        raise RuntimeError(f"فشل رفع الملف ({r.status_code}): {r.text[:200]}")
-    return f"{url}/storage/v1/object/public/{BUCKET}/{path}?download={quote(download_name)}"
+def get_exported_file_path(filename: str) -> str:
+    return os.path.join(EXPORTS_DIR, filename)

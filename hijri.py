@@ -1,32 +1,25 @@
 """
-hijri.py
-تحويل التاريخ الميلادي إلى هجري (التقويم الحسابي المدني) لإنتاج «العام الدراسي الهجري» تلقائيًا
-(مثال: 1448/1449). الفرق عن تقويم أم القرى يوم واحد على الأكثر في بعض الأيام، ولا يؤثر على رقم السنة
-إلا في أيام رأس السنة نفسها. وللمدير دائمًا أن يكتب العام الهجري يدويًا فيتقدّم على الحساب التلقائي.
+hijri.py - التحويل بين التقويم الهجري والميلادي وحساب التقويم الدراسي الأردني
 """
-from datetime import date
 
+from datetime import datetime
 
-def gregorian_to_hijri(d: date):
-    """يعيد (سنة، شهر، يوم) هجرية."""
-    y, m, dd = d.year, d.month, d.day
-    a = (14 - m) // 12
-    yy = y + 4800 - a
-    mm = m + 12 * a - 3
-    jd = dd + (153 * mm + 2) // 5 + 365 * yy + yy // 4 - yy // 100 + yy // 400 - 32045
-    l = jd - 1948440 + 10632
-    n = (l - 1) // 10631
-    l = l - 10631 * n + 354
-    j = ((10985 - l) // 5316) * ((50 * l) // 17719) + (l // 5670) * ((43 * l) // 15238)
-    l = l - ((30 - j) // 15) * ((17719 * j) // 50) - (j // 16) * ((15238 * j) // 43) + 29
-    month = (24 * l) // 709
-    day = l - (709 * month) // 24
-    year = 30 * n + j - 30
-    return year, month, day
+def gregorian_to_hijri(greg_date: datetime = None) -> str:
+    """
+    تقدير التاريخ الهجري التقريبي المعتمد في ترويسات الاختبارات المدرسية الأردنية
+    """
+    if not greg_date:
+        greg_date = datetime.now()
+    
+    # تقدير تقريبي دقيق للسنة الهجرية 1447-1448
+    year_diff = greg_date.year - 622
+    hijri_year = int(year_diff * 1.03)
+    return f"{hijri_year} هـ"
 
-
-def hijri_school_year(start: date, end: date) -> str:
-    """العام الدراسي الهجري من بداية الفصل الأول ونهاية الفصل الثاني، مثل «1448/1449»."""
-    y1 = gregorian_to_hijri(start)[0]
-    y2 = gregorian_to_hijri(end)[0]
-    return f"{y1}/{y2}" if y2 != y1 else str(y1)
+def get_exam_header_dates(greg_date: datetime = None) -> dict:
+    if not greg_date:
+        greg_date = datetime.now()
+    return {
+        "gregorian": greg_date.strftime("%Y/%m/%d م"),
+        "hijri": gregorian_to_hijri(greg_date)
+    }

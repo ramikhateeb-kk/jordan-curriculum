@@ -1,11 +1,6 @@
-streamlit>=1.52.0
-google-genai
-pymupdf>=1.24.0
-requests
-pandas
-python-docx
-gTTS>=2.5.0
-PyPDF2>=3.0.0
-Pillow>=10.0.0
-python-pptx
-openpyxl
+streamlit>=1.35.0
+google-generativeai>=0.8.0
+python-dotenv>=1.0.1
+pandas>=2.2.0
+openpyxl>=3.1.2
+requests>=2.31.0

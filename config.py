@@ -1,12 +1,15 @@
 import os
-from pathlib import Path
+from dotenv import load_dotenv
 
-BASE = Path(__file__).parent
-PDF_DIR = BASE / "data" / "pdfs"      # data/pdfs/<grade>/<semester>/<slug>.pdf  (تُحمَّل تلقائيًا من رابط الكتاب)
-INDEX_DIR = BASE / "data" / "index"   # نص الكتاب المقسّم للبحث المحلي
+load_dotenv()
 
-# غيّر اسم النموذج إن تغيّر في Google AI Studio
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Gemini AI API Configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-GRADES = ["الأول", "الثاني", "الثالث", "الرابع", "الخامس", "السادس",
-          "السابع", "الثامن", "التاسع", "العاشر", "الحادي عشر", "الثاني عشر"]
+# Default Jordan Ministry of Education Settings
+DEFAULT_GRADE = "الصف الرابع الأساسي"
+DEFAULT_SEMESTER = "الفصل الأول"
+APP_NAME = "رفيق المنهاج الأردني المطور - المعلم الذكي"
+
+# Model Configuration
+DEFAULT_MODEL = "gemini-3.8-flash"
