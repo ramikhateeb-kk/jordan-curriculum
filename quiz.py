@@ -288,11 +288,25 @@ def _plain(text):
     return re.sub(r"\[\[(.+?)\]\]", r"\1", str(text), flags=re.S)
 
 
+def _english_assessment_type(slug, lesson):
+    """نوع السؤال المطلوب في تبويب قيّمني للإنجليزية: Reading سؤال قصير، وبقية الدروس اختيار من متعدد."""
+    title = str(lesson.get("title", ""))
+    is_english = "english" in str(slug or "").lower() or bool(re.search(r"\b(reading|vocabulary|grammar|listening|writing|speaking)\b", title, re.I))
+    if not is_english:
+        return None
+    return "short" if sp.lesson_kind(title) == "reading" else "mcq"
+
+
 def next_question(client, idx, slug, lessons, quiz):
-    """يفحص أولًا قاعدة الأسئلة عبر كل الدروس المطلوبة معًا، ويختار سؤالًا غير مُستخدَم عشوائيًا إن وُجد.
-    لا يُولَّد سؤال جديد بالذكاء الاصطناعي إلا إذا لم يبقَ أي سؤال غير مُستخدَم في البنك لهذه الدروس ونوع السؤال.
-    في دروس القراءة الإنجليزية: إن طلب الطالب سؤالًا آخر يُعرض النص نفسه مع سؤال جديد (حتى PASSAGE_REUSE أسئلة)."""
-    qtype = quiz["qtype"] if quiz["qtype"] != "mixed" else random.choice(["mcq", "tf", "fill", "short"])
+    """يفحص أولًا قاعدة الأسئلة عبر الدروس المطلوبة، ويختار سؤالًا غير مستخدم إن وُجد.
+    في تقييم الإنجليزية يُفرض short على دروس Reading وmcq على بقية الدروس، حتى عند اختيار عدة دروس."""
+    if quiz.get("qtype") == "english_auto":
+        possible = { _english_assessment_type(slug, lesson) for lesson in lessons }
+        possible.discard(None)
+        qtype = random.choice(sorted(possible)) if possible else "mcq"
+        lessons = [lesson for lesson in lessons if _english_assessment_type(slug, lesson) == qtype]
+    else:
+        qtype = quiz["qtype"] if quiz["qtype"] != "mixed" else random.choice(["mcq", "tf", "fill", "short"])
 
     # --- 1) سؤال آخر على القطعة الحالية
     ps = quiz.get("passage")
@@ -396,10 +410,22 @@ def render_quiz(idx, slug, lessons):
     if quiz is None:
         st.subheader("اختبر نفسك")
         st.caption("الدروس المختارة: " + "، ".join(l["title"] for l in lessons))
-        qt = st.selectbox("نوع الأسئلة", list(QTYPES))
+        english_types = [_english_assessment_type(slug, lesson) for lesson in lessons]
+        is_english_assessment = all(t is not None for t in english_types)
+        if is_english_assessment:
+            unique_types = set(english_types)
+            if unique_types == {"short"}:
+                st.info("نوع الأسئلة محدد تلقائيًا: أسئلة قصيرة فقط، لأن الدرس المختار من نوع Reading.")
+            elif unique_types == {"mcq"}:
+                st.info("نوع الأسئلة محدد تلقائيًا: اختيار من متعدد فقط لهذا الدرس.")
+            else:
+                st.info("سيُحدَّد نوع السؤال تلقائيًا حسب الدرس: Reading = أسئلة قصيرة، وبقية الدروس = اختيار من متعدد.")
+            qt = "english_auto"
+        else:
+            qt = QTYPES[st.selectbox("نوع الأسئلة", list(QTYPES))]
         n = st.number_input("عدد الأسئلة", min_value=1, value=5, step=1)
         if st.button("ابدأ التقييم", type="primary"):
-            S["quiz"] = {"qtype": QTYPES[qt], "n": int(n), "i": 0, "score": 0.0,
+            S["quiz"] = {"qtype": qt if is_english_assessment else qt, "n": int(n), "i": 0, "score": 0.0,
                          "asked_ids": set(), "asked_texts": [], "cur": None, "res": None, "hist": []}
             st.rerun()
         return
