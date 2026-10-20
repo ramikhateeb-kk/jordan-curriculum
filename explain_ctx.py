@@ -1,277 +1,128 @@
-# -*- coding: utf-8 -*-
 """
-explain_ctx.py - وحدة شرح الدروس وحل أسئلة المنهاج الأردني (اشرح لي)
-مع دعم التنسيق الصحيح للغة الإنجليزية (LTR)، إزالة الأسطر الفارغة من كتاب الأنشطة،
-والبحث الذكي بالذكاء الاصطناعي لحل أسئلة الصفحات دون رسائل تعذر خاطئة.
+explain_ctx.py
+مواد «اشرح لي» الإضافية لدرس/وحدة محددة: تمارين الكتاب المرافق (الأنشطة)، والأسئلة الوزارية المعتمدة على الدرس، وشرح القواعد الخارجي.
 """
-
+import json
 import re
-import os
+
 import streamlit as st
-from typing import Dict, Any, List, Optional
+from google.genai import types
 
-# دالة تنظيف الأسطر الفارغة الزائدة
-def clean_empty_lines(text: str) -> str:
-    """إزالة الأسطر الفارغة المتكررة والمسافات الزائدة من نصوص كتب الأنشطة والتمارين"""
-    if not text:
-        return ""
-    # استبدال المسافات والأسطر الفارغة المتتالية بسطر واحد فقط
-    cleaned = re.sub(r'\r\n', '\n', text)
-    cleaned = re.sub(r'\r', '\n', cleaned)
-    lines = [line.strip() for line in cleaned.splitlines()]
-    
-    result_lines = []
-    prev_blank = False
-    for line in lines:
-        if line:
-            result_lines.append(line)
-            prev_blank = False
-        elif not prev_blank and result_lines:
-            result_lines.append("")
-            prev_blank = True
-            
-    return "\n".join(result_lines).strip()
+import companion
+import grammar_ext
+import ministry
+import subject_profiles as sp
+from config import GEMINI_MODEL
+from rag import get_client
 
-# التحقق من صلة السؤال بالمنهاج المختار بدقة
-def is_question_relevant_to_subject(subject: str, query: str) -> tuple[bool, str]:
-    """
-    التحقق الصارم من صلة السؤال بالمادة المقررة.
-    لا يتم رفض السؤال إلا إذا كان لا صلة له إطلاقاً بالمادة المحددة،
-    مثل سؤال عن دورة الماء في كتاب التاريخ.
-    أما أسئلة الصفحات وحلول التمارين فتعتبر دائماً مقبولة ويتم حلها بالذكاء الاصطناعي.
-    """
-    q = query.strip().lower()
-    subj = (subject or "").strip().lower()
-    
-    # 1. إذا كان السؤال يطلب حلاً برقم الصفحة أو التمرين، فهو دائماً متعلق بالمنهاج
-    page_ex_pattern = re.compile(r'(صفحة|صفحه|ص\s*\d+|تمرين|سؤال|مسألة|question|ex|exercise|page|p\.\s*\d+)', re.IGNORECASE)
-    if page_ex_pattern.search(q):
-        return True, ""
-        
-    # 2. فحص التقاطعات المتعارضة تماماً بين التخصصات
-    # مثال: العلوم في التاريخ
-    if "تاريخ" in subj or "history" in subj:
-        science_keywords = ['دورة الماء', 'التمثيل الضوئي', 'خلية', 'نيوتن', 'تسارع', 'تفاعل كيميائي', 'photosynthesis', 'water cycle', 'dna', 'الذرة', 'الجدول الدوري', 'الميتوكندريا']
-        for kw in science_keywords:
-            if kw in q:
-                return False, f"تعذر تقديم الإجابة: هذا السؤال عن ({kw}) يتعلق بمناهج العلوم والفيزياء، ولا علاقة له بمنهاج تاريخ الأردن المقرر."
-                
-    # مثال: الرياضيات المتقدمة في التربية الإسلامية
-    if "إسلامية" in subj or "دين" in subj or "islamic" in subj:
-        math_physics_keywords = ['تكامل', 'تفاضل', 'قوانين نيوتن', 'لوغاريتم', 'الاحتمالات المشروطة', 'المصفوفات', 'اشتقاق']
-        for kw in math_physics_keywords:
-            if kw in q:
-                return False, f"تعذر تقديم الإجابة: هذا السؤال عن ({kw}) يخص مادة الرياضيات أو العلوم، ولا يقع ضمن مباحث مادة التربية الإسلامية."
-                
-    # مثال: التاريخ في الرياضيات
-    if "رياضيات" in subj or "math" in subj:
-        history_keywords = ['معركة حطين', 'مسلة ميشع', 'الاستقلال 1946', 'الشريف الحسين بن علي', 'الثورة العربية الكبرى']
-        for kw in history_keywords:
-            if kw in q:
-                return False, f"تعذر تقديم الإجابة: هذا السؤال عن ({kw}) تاريخي، ولا صلة له بمنهاج الرياضيات المقررة."
+WORKBOOK_MAX = 9000
+MAX_LESSONS = 6
+MAX_GRAMMAR = 2
 
-    return True, ""
 
-# فحص ما إذا كان المحتوى باللغة الإنجليزية
-def is_english_content(text: str, subject_name: str = "") -> bool:
-    if "english" in subject_name.lower() or "إنجليزي" in subject_name.lower() or "action pack" in subject_name.lower():
-        return True
-    english_chars = len(re.findall(r'[a-zA-Z]', text))
-    arabic_chars = len(re.findall(r'[\u0600-\u06FF]', text))
-    return english_chars > arabic_chars
-
-# دالة توليد الشرح باستخدام الذكاء الاصطناعي مع معالجة كتب الأنشطة واللغة الإنجليزية
-def get_explanation(
-    grade: str,
-    subject: str,
-    book_type: str,
-    query: str,
-    unit: Optional[str] = None,
-    context_text: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    توليد الشرح وحل الأسئلة بالذكاء الاصطناعي مع:
-    1. التحقق من صلة السؤال (رفض الأسئلة الخارجة عن المنهاج فقط).
-    2. حل أسئلة الصفحات بالذكاء الاصطناعي دون إظهار تعذر الوجود.
-    3. تنظيف فراغات كتاب الأنشطة.
-    4. تنسيق اللغة الإنجليزية LTR.
-    """
-    clean_query = query.strip()
-    
-    # التحقق من الصلة
-    is_rel, reason = is_question_relevant_to_subject(subject, clean_query)
-    if not is_rel:
-        return {
-            "success": False,
-            "is_off_topic": True,
-            "message": reason,
-            "content": reason,
-            "direction": "rtl"
-        }
-        
-    is_eng = is_english_content(clean_query, subject)
-    cleaned_context = clean_empty_lines(context_text or "")
-    
-    # بناء التعليمات النموذجية لـ Gemini
-    prompt = f"""
-أنت خبير ومعلم متخصص في المناهج المدرسية لوزارة التربية والتعليم في المملكة الأردنية الهاشمية.
-المطلوب: تقديم حل وشرح مفصل ودقيق ومطابق لكتاب الوزارة.
-
-معطيات السؤال:
-- الصف: {grade}
-- المادة: {subject}
-- الكتاب: {book_type} (كتاب الأنشطة والتمارين أو كتاب الطالب)
-{f'- الوحدة: {unit}' if unit else ''}
-{f'- سياق نصوص المنهاج المستخرجة (كتاب الأنشطة):\n{cleaned_context}' if cleaned_context else ''}
-
-سؤال أو طلب الطالب:
-"{clean_query}"
-
-تعليمات التنسيق والحل:
-1. إذا كان السؤال عن رقم سؤال وصفحة (مثال: حل سؤال 4 صفحة 22):
-   - قم فوراً بصياغة نص السؤال وفق المنهاج الأردني، ثم قدم الحل النموذجي المباشر، ثم الشرح خطوة بخطوة.
-   - لا تقل أبداً "تعذر وجود إجابة" طالما أن السؤال من المنهاج والمادة المحددة.
-2. إذا كانت المادة لغة إنجليزية (Action Pack):
-   - يجب أن يكون اتجاه عرض الشرح LTR (من اليسار لليمين) مع محاذاة لليسار للإنجليزية، لضمان سلامة علامات الترقيم (الأقواس، النقاط، علامات الاستفهام).
-   - رتب الإجابة كالتالي:
-     * Question Statement (نص السؤال)
-     * Model Solution (الحل المباشر والنموذجي)
-     * Step-by-Step Explanation (الشرح بالإنجليزية مع توضيح بالعربية)
-     * Key Grammar Rule / Formula (قاعدة الدرس في إطار محدد)
-     * Vocabulary & Pronunciation (جدول الكلمات الجديدة واللفظ)
-     * Check Your Understanding (سؤال تدريبي إضافي مع إجابته)
-3. تجنب تماماً ترك أسطر فارغة متكررة في الشرح وعرض نصوص كتاب الأنشطة.
-"""
-
+def build(slug, idx, flat_lessons, scope_titles, user, lang, topic_en=None):
+    """مواد «اشرح لي» من المنهاج: تمارين كتاب الأنشطة والأسئلة الوزارية المعتمدة على الدروس. (شرح القواعد الخارجي لا يُدرَج هنا؛
+    يُعرض بعد الشرح من المنهاج عند طلب الطالب أو عند غياب الشرح في المنهاج.) topic_en = موضوع القاعدة المطلوبة إن وُجد."""
+    lessons = [l for l in flat_lessons if l["title"] in set(scope_titles)][:MAX_LESSONS]
+    extras = {"workbook": "", "ministry": "", "grammar_topic": topic_en or ""}
+    if not lessons:
+        return extras
+    parts = []
+    for l in lessons:
+        t = companion.exercises_text(l, max_chars=3000)
+        if t:
+            parts.append(f"[{l['title']}]\n{t}")
+    extras["workbook"] = "\n\n".join(parts)[:WORKBOOK_MAX]
     try:
-        # محاولة الاستدعاء عبر Google GenAI / Gemini
-        import google.generativeai as genai
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        if api_key:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content(prompt)
-            result_text = clean_empty_lines(response.text)
-            return {
-                "success": True,
-                "is_off_topic": False,
-                "content": result_text,
-                "is_english": is_eng,
-                "direction": "ltr" if is_eng else "rtl"
-            }
-    except Exception as e:
+        if ministry.is_visible(slug) or user["role"] in ("admin", "supervisor"):
+            extras["ministry"] = ministry.examples_for_lessons(slug, [l["title"] for l in lessons], 6, lang)
+    except Exception:  # noqa: BLE001
         pass
+    return extras
 
-    # حل احتياطي منهجي دقيق في حال عدم توفر مفتاح الـ API
-    fallback_content = _generate_structured_curriculum_solution(grade, subject, book_type, clean_query, is_eng)
-    return {
-        "success": True,
-        "is_off_topic": False,
-        "content": clean_empty_lines(fallback_content),
-        "is_english": is_eng,
-        "direction": "ltr" if is_eng else "rtl"
-    }
 
-def _generate_structured_curriculum_solution(grade: str, subject: str, book_type: str, query: str, is_eng: bool) -> str:
-    """توليد حل نموذجي منظم وفق معايير وزارة التربية والتعليم الأردنية"""
-    if is_eng:
-        return f"""
-📌 [Question & Page Location in Curriculum]:
-{book_type} - Jordanian Curriculum ({grade} - {subject})
-Query: "{query}"
+def external(slug, idx, flat_lessons, followup):
+    """الشرح المفصّل من مصادر خارجية لموضوع القاعدة: followup = {"kind":"topic","topic":...} أو {"kind":"lesson","lesson": عنوان}.
+    يعيد {content, sources} أو None. يُخزَّن ويُعاد استعماله."""
+    if followup.get("kind") == "topic":
+        return grammar_ext.get_topic_explanation(slug, followup["topic"], idx)
+    lesson = next((l for l in flat_lessons if l["title"] == followup.get("lesson")), None)
+    return grammar_ext.get_explanation(slug, lesson, idx) if lesson else None
 
-✅ [Model Solution & Direct Answer]:
-1. The model answer is verified according to the Ministry of Education (Action Pack) Teacher's Guide.
-2. Complete sentence structure follows standard grammatical rules with proper subject-verb agreement.
 
-💡 [Step-by-Step Educational Explanation]:
-- Identify the context clue and grammatical tense indicators in the sentence.
-- Apply the appropriate rule (e.g. Causative form, Reported Speech, or Tense sequence).
-- Ensure punctuation and capitalization are correctly placed at the start and end of each sentence.
+ROUTE_SYSTEM = (
+    "You route a student's question about an English textbook (the student may write in Arabic). Return JSON only: "
+    '{"keywords_en": "3-8 English keywords to find the relevant textbook pages (translate any Arabic term, e.g. '
+    'الماضي التام المستمر -> past perfect continuous)", "is_grammar": true/false (the student asks about an English grammar '
+    'rule, tense or structure), "topic_en": "the grammar topic name in English, e.g. Past Perfect Continuous, or null"}.')
 
-📖 [Key Rule & Grammar Box]:
-Rule: Subject + Auxiliary Verb + Main Verb (Participle / Base form) according to the unit structure.
-Note: Pay close attention to irregular verbs and spelling changes.
 
-📚 [Vocabulary & Useful Terms (المفردات والدلالات)]:
-- Key Terms: Key lesson vocabulary and derivation forms.
-- Arabic Notes: تم التحقق من الحل خطوة بخطوة لضمان مطابقة متطلبات الاختبارات الوزارية.
+@st.cache_data(ttl=7 * 24 * 3600, max_entries=2000, show_spinner=False)
+def route(question):
+    """يحلّل سؤال الطالب (عربي أو إنجليزي): كلمات بحث إنجليزية للعثور على صفحات الكتاب، وهل هو سؤال قواعد وما اسم القاعدة.
+    يعيد {} عند الفشل (فيستمر النظام كما كان)."""
+    try:
+        r = get_client().models.generate_content(
+            model=GEMINI_MODEL, contents=f"Student question:\n{question[:600]}",
+            config=types.GenerateContentConfig(system_instruction=ROUTE_SYSTEM, temperature=0,
+                                                response_mime_type="application/json"))
+        d = json.loads(re.sub(r"^```(?:json)?|```$", "", (r.text or "").strip()).strip())
+    except Exception as e:  # noqa: BLE001
+        print("explain_ctx.route:", e)
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    topic = d.get("topic_en")
+    topic = str(topic).strip()[:80] if isinstance(topic, str) and topic.strip() and bool(d.get("is_grammar")) else None
+    return {"keywords_en": str(d.get("keywords_en") or "")[:120].strip(), "is_grammar": bool(d.get("is_grammar")) and bool(topic),
+            "topic_en": topic}
 
-🎯 [Check Your Understanding (اختبر فهمك)]:
-Apply the same rule to solve parallel exercises in the Activity Book.
-""".strip()
-    else:
-        return f"""
-📌 [المسألة ونطاقها في المنهاج الأردني]:
-{book_type} - منهاج وزارة التربية والتعليم الأردنية ({grade} - {subject})
-الموضوع المطلوب: "{query}"
 
-✅ [الإجابة النموذجية المباشرة]:
-الحل المعتمد والنهائي وفق كتاب الوزارة ودليل المعلم.
+def lessons_for_topic(idx, flat_lessons, query, limit=2):
+    """أنسب دروس الكتاب لموضوع (بالإنجليزية): عدد مرات ورود كلمات الموضوع في صفحات كل درس، مع ترجيح العنوان."""
+    words = {w for w in re.findall(r"[a-z]{4,}", query.lower())}
+    if not words:
+        return []
+    scored = []
+    for l in flat_lessons:
+        text = " ".join(p["text"].lower() for p in idx[0] if l["start"] <= p["page"] <= l["end"])
+        score = sum(text.count(w) for w in words) + 8 * sum(w in l["title"].lower() for w in words)
+        if score > 0:
+            scored.append((score, l["title"]))
+    return [t for _s, t in sorted(scored, key=lambda x: -x[0])[:limit]]
 
-💡 [خطوات الحل والشرح بالتفصيل]:
-1. تحديد المعطيات والمفاهيم الأساسية الواردة في السؤال.
-2. تطبيق القاعدة والقانون المنهجي المعتمد في كتاب الطالب وكتاب الأنشطة والتمارين.
-3. كتابة الناتج النهائي مدعماً بالتعليل والتوضيح السليم.
 
-📖 [القاعدة والمفهوم الأساسي]:
-قاعدة الدرس: ترسيخ نتاجات التعلم الخاصة بالوحدة وربطها بالتطبيقات الحياتية.
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_PAGE_RX = re.compile(r"(?<!\w)(?:صفحة|صفحه|الصفحة|ص|page|p)\.?\s*[:\-]?\s*(\d{1,3})(?!\d)", re.I)
 
-💡 [إضاءة امتحانية لطلبة الأردن]:
-احرص دائماً على كتابة خطوات الحل كاملة في الاختبارات الوزارية والمدرسية، حيث توزع الدرجات على كل خطوة من خطوات الحل.
-""".strip()
 
-# تنسيق مخصص لعرض الشرح في Streamlit مع دعم كامل للغة الإنجليزية LTR
-def render_explanation_ui(explanation_data: Dict[str, Any]):
-    """عرض الشرح في واجهة Streamlit مع ضبط الاتجاه والتنسيق المناسب للغة الإنجليزية"""
-    if not explanation_data:
-        return
-        
-    if explanation_data.get("is_off_topic"):
-        st.warning(f"⚠️ {explanation_data.get('message', 'السؤال خارج المنهاج')}")
-        return
-        
-    content = explanation_data.get("content", "")
-    is_eng = explanation_data.get("is_english", False)
-    direction = explanation_data.get("direction", "ltr" if is_eng else "rtl")
-    
-    # شريط أدوات التحكم بالاتجاه
-    col1, col2 = st.columns([8, 2])
-    with col2:
-        dir_choice = st.selectbox(
-            "اتجاه النص",
-            options=["تلقائي", "LTR (إنجليزي)", "RTL (عربي)"],
-            index=1 if is_eng else 2,
-            key="explain_dir_select"
-        )
-        if dir_choice == "LTR (إنجليزي)":
-            direction = "ltr"
-        elif dir_choice == "RTL (عربي)":
-            direction = "rtl"
+def parse_page(question):
+    """رقم الصفحة المطبوعة الذي ذكره الطالب («حل سؤال 5 في صفحة 30») أو None."""
+    m = _PAGE_RX.search(str(question).translate(_AR_DIGITS))
+    return int(m.group(1)) if m else None
 
-    # تنسيق بطاقة العرض بالـ CSS المناسب لاتجاه اللغة الإنجليزية
-    text_align = "left" if direction == "ltr" else "right"
-    font_family = "Segoe UI, Tahoma, Geneva, Verdana, sans-serif" if direction == "ltr" else "'Cairo', sans-serif"
-    
-    st.markdown(
-        f"""
-        <div style="
-            direction: {direction};
-            text-align: {text_align};
-            font-family: {font_family};
-            background-color: #f8fafc;
-            border: 1px solid #e2e8f0;
-            border-radius: 14px;
-            padding: 22px;
-            margin-top: 12px;
-            line-height: 1.8;
-            color: #1e293b;
-        ">
-        """,
-        unsafe_allow_html=True
-    )
-    
-    # عرض محتوى الشرح
-    st.markdown(content)
-    
-    st.markdown("</div>", unsafe_allow_html=True)
+
+def _which_books(question):
+    q = str(question).lower()
+    workbook = bool(re.search(r"الأنشطة|الانشطة|النشاط|workbook|activity", q))
+    student = bool(re.search(r"كتاب الطالب|student", q))
+    return (not workbook or student), (workbook or not student)
+
+
+def asked_pages(question, idx, offset, comp_idx=None, comp_offset=0):
+    """نصوص الصفحة التي ذكرها الطالب من كتاب الطالب و/أو كتاب الأنشطة: [{source, page, text}]."""
+    page = parse_page(question)
+    if not page:
+        return []
+    from rich_text import clean_text
+    use_main, use_comp = _which_books(question)
+    out = []
+    if use_main:
+        for p in idx[0]:
+            if p["page"] == page + offset:
+                out.append({"source": "كتاب الطالب", "page": page, "text": clean_text(p["text"])[:4000]})
+    if use_comp and comp_idx:
+        for p in comp_idx[0]:
+            if p["page"] == page + comp_offset:
+                out.append({"source": "كتاب الأنشطة", "page": page, "text": clean_text(p["text"])[:4000]})
+    return out

@@ -1,11 +1,12 @@
-# -*- coding: utf-8 -*-
 import os
-from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+BASE = Path(__file__).parent
+PDF_DIR = BASE / "data" / "pdfs"      # data/pdfs/<grade>/<semester>/<slug>.pdf  (تُحمَّل تلقائيًا من رابط الكتاب)
+INDEX_DIR = BASE / "data" / "index"   # نص الكتاب المقسّم للبحث المحلي
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-APP_TITLE = "المساعد الذكي للمناهج الأردنية"
-MINISTRY_NAME = "وزارة التربية والتعليم - المملكة الأردنية الهاشمية"
-DEFAULT_GRADE = "الثاني الثانوي - التوجيهي"
-DEFAULT_SUBJECT = "اللغة الإنجليزية (Action Pack)"
+# غيّر اسم النموذج إن تغيّر في Google AI Studio
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+GRADES = ["الأول", "الثاني", "الثالث", "الرابع", "الخامس", "السادس",
+          "السابع", "الثامن", "التاسع", "العاشر", "الحادي عشر", "الثاني عشر"]

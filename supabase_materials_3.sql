@@ -1,11 +1,16 @@
--- supabase_materials_3.sql: فهرس نصوص وتضمينات البحث الدلالي لكتاب الأنشطة
-CREATE TABLE IF NOT EXISTS jordan_activity_exercises (
-    id SERIAL PRIMARY KEY,
-    unit_id INTEGER REFERENCES jordan_units(id),
-    page_number INTEGER NOT NULL,
-    exercise_number TEXT NOT NULL,
-    title TEXT,
-    prompt TEXT NOT NULL,
-    solution TEXT NOT NULL,
-    direction TEXT DEFAULT 'rtl'
+-- =====================================================================
+-- supabase_materials_3.sql — نصوص القراءة المعتمدة (بتنسيقها الأصلي) وتمارين الدرس
+-- شغّله بعد supabase_materials_2.sql. آمن عند إعادة التشغيل.
+-- =====================================================================
+create table if not exists reading_texts (
+  id            bigint generated always as identity primary key,
+  book_slug     text not null,
+  lesson_title  text not null,
+  title         text,                  -- عنوان النص إن طُبع
+  text          text not null,         -- النص بأسطره وفقراته كما في الكتاب (فقرة = سطر فارغ بينها)
+  exercises     text,                  -- تمارين الدرس المطبوعة في الصفحات نفسها (للاستئناس عند التوليد)
+  source        text not null default 'ai' check (source in ('ai','manual')),
+  updated_by    bigint,
+  updated_at    timestamptz not null default now(),
+  unique (book_slug, lesson_title)
 );

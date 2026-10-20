@@ -1,170 +1,593 @@
-# -*- coding: utf-8 -*-
-"""
-app.py - المساعد الذكي للمناهج المدرسية الأردنية (وزارة التربية والتعليم)
-Streamlit Application
-"""
-
+import io
+import json
+import re
 import streamlit as st
-from explain_ctx import get_explanation, clean_empty_lines, render_explanation_ui
+from PIL import Image
+from gtts import gTTS
+from google.genai import types
 
-# إعدادات الصفحة
-st.set_page_config(
-    page_title="المساعد الذكي للمناهج الأردنية",
-    page_icon="🇯🇴",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+import accounts as acc
+import auth_ui
+import catalog
+import companion
+import explain_ctx
+import grammar_ext
+import ingest
+import rich_text
+import subject_profiles as sp
+import profile_ctx
+from config import GEMINI_MODEL
+from exam import render_exam_builder
+from lesson_plan import render_lesson_plan_builder
+from semester_plan import render_semester_plan_builder
+from content_analysis import render_content_analysis_builder
+from attendance import render_attendance_builder
+from marks_book import render_marks_book_builder
+from ministry import render_ministry
+from qbank_manager import render_qbank_builder
+from quiz import render_quiz
+from rag import answer, get_client, load_index, select_context
+from slides import render_slides_builder
+from teach_help import render_teach_help_builder
 
-# تخصيص المظهر بالـ CSS ليتناسب مع اللغة العربية والإنجليزية
+st.set_page_config(page_title="مساعد المنهاج الأردني", page_icon="📚", layout="centered")
+
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap');
-    
-    html, body, [class*="css"] {
-        font-family: 'Cairo', sans-serif;
-    }
-    
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 8px 8px 0 0;
-        padding: 10px 18px;
-        font-weight: 700;
-    }
-    
-    .activity-card {
-        background-color: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 10px;
-        padding: 14px;
-        margin-bottom: 10px;
-    }
+html, body, .stApp, [data-testid="stMarkdownContainer"] { direction: rtl; text-align: right; }
+[data-testid="stSelectbox"] div, textarea, input { direction: rtl; text-align: right; }
+
+.hero {
+    background: linear-gradient(120deg, #1e3a5f 0%, #2e6f5e 100%);
+    padding: 28px 24px; border-radius: 18px; margin-bottom: 20px; text-align: center;
+    box-shadow: 0 6px 18px rgba(0,0,0,.12);
+}
+.hero h1 { color: #fff; margin: 0 0 6px 0; font-size: 1.7rem; }
+.hero p { color: #dfe9e6; margin: 0; font-size: .95rem; }
+
+/* شريط الإدخال الموحّد (إرفاق + نص + ميكروفون) */
+[data-testid="stChatInput"] { direction: ltr; }
+[data-testid="stChatInput"] > div {
+    border-radius: 28px; border: 1px solid #e2e2e2; background: #fff;
+    box-shadow: 0 2px 10px rgba(0,0,0,.08);
+}
+[data-testid="stChatInput"] textarea { direction: rtl; text-align: right; }
+
+div[data-testid="stButton"] > button {
+    width: 100%; padding: 12px 10px; border-radius: 14px; border: 1px solid #e2e2e2;
+    background: #ffffff; font-size: 1.05rem; font-weight: 600; color: #1e3a5f;
+    box-shadow: 0 2px 8px rgba(0,0,0,.06); transition: all .15s ease;
+}
+div[data-testid="stButton"] > button:hover {
+    border-color: #2e6f5e; box-shadow: 0 4px 14px rgba(46,111,94,.25); transform: translateY(-2px);
+    color: #2e6f5e;
+}
+div[data-testid="stButton"] > button[kind="primary"] {
+    background: linear-gradient(120deg, #2e6f5e, #1e3a5f); color: #fff; border: none;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# القائمة الجانبية - اختيار الصف والمادة
-with st.sidebar:
-    st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/c/c0/Coat_of_arms_of_Jordan.svg/200px-Coat_of_arms_of_Jordan.svg.png", width=70)
-    st.title("المناهج الأردنية 🇯🇴")
-    st.caption("وزارة التربية والتعليم - المملكة الأردنية الهاشمية")
-    st.divider()
-    
-    grade = st.selectbox(
-        "الصف الدراسي",
-        options=[
-            "الثاني الثانوي - التوجيهي",
-            "الأول الثانوي",
-            "الصف العاشر الأساسي",
-            "الصف التاسع الأساسي",
-            "الصف الثامن الأساسي",
-            "الصف السابع الأساسي",
-            "الصف السادس الأساسي",
-            "الصف الخامس الأساسي",
-            "الصف الرابع الأساسي",
-            "الصف الأول الأساسي"
-        ],
-        index=0
-    )
-    
-    subject = st.selectbox(
-        "المادة الدراسية",
-        options=[
-            "اللغة الإنجليزية (Action Pack)",
-            "الرياضيات",
-            "اللغة العربية (مهارات الاتصال)",
-            "العلوم العامة",
-            "الفيزياء",
-            "الكيمياء",
-            "العلوم الحياتية (الأحياء)",
-            "تاريخ الأردن",
-            "التربية الإسلامية"
-        ],
-        index=0
-    )
-    
-    book_type = st.radio(
-        "الكتاب المعتمد",
-        options=["كتاب الأنشطة والتمارين (Activity Book)", "كتاب الطالب (Student's Book)"],
-        index=0
-    )
-    
-    semester = st.radio("الفصل الدراسي", options=["الفصل الأول", "الفصل الثاني"], index=0)
+st.markdown("""
+<div class="hero">
+  <h1>📚 مساعد المنهاج الأردني</h1>
+  <p>اختر صفّك ومادتك، واحصل على شرح أو تقييم من الكتاب مباشرة</p>
+</div>
+""", unsafe_allow_html=True)
 
-# التبويبات الرئيسية
-tabs = st.tabs([
-    "💡 اشرح لي",
-    "❓ بنك الأسئلة والاختبارات",
-    "📚 الكتب والمناهج",
-    "📝 خطط الدروس والخطط الفصلية",
-    "📊 تحليل المحتوى"
-])
 
-# ----------------- تبويب اشرح لي -----------------
-with tabs[0]:
-    st.subheader("💡 تبويب 'اشرح لي' وحل أسئلة المنهاج")
-    st.info(f"المادة المحددة: **{subject}** - **{grade}** - **{book_type}**")
-    
-    query = st.text_input(
-        "اكتب رقم السؤال والصفحة أو الموضوع الذي ترغب في شرحه:",
-        placeholder="مثال: حل سؤال رقم 2 في صفحة 7 في كتاب الأنشطة، أو explain exercise 3 on page 8"
-    )
-    
-    col1, col2 = st.columns([8, 2])
-    with col1:
-        explain_btn = st.button("🚀 اشرح وحل السؤال بالذكاء الاصطناعي", type="primary", use_container_width=True)
-    with col2:
-        search_ab_btn = st.button("🔍 بحث بكتاب الأنشطة", use_container_width=True)
+def clean_markdown_for_speech(text):
+    """تنظيف النص من رموز التنسيق لضمان القراءة الصوتية الواضحة"""
+    text = re.sub(r'\*+|\#+|`+|_+', '', text)
+    text = re.sub(r'\[.*?\]\(.*?\)', '', text)
+    text = re.sub(r'\n+', ' ', text)
+    return text.strip()
+
+
+def text_to_speech(text, lang='ar'):
+    """تحويل النص إلى صوت مسموع بصوت المعلم (نبرة ذكر أعمق وأبطأ)"""
+    try:
+        clean_text = clean_markdown_for_speech(text)
+        if not clean_text:
+            return None
+        clean_text = clean_text[:1000]
         
-    # عرض نتائج البحث في كتاب الأنشطة بدون أسطر فارغة
-    if search_ab_btn and query.strip():
-        st.write("##### 📋 نتائج مطابقة السؤال في كتاب الأنشطة (بدون أسطر فارغة):")
-        with st.spinner("جاري مسح كتاب الأنشطة والتمارين..."):
-            cleaned_snippet = clean_empty_lines(f"""
-            [كتاب الأنشطة - صفحة 7 - تمرين 2]
-            Complete the sentences using the Causative form:
-            1. I didn't repair my computer myself; I had it repaired by a technician.
-            [الحل المعتمد]: had it repaired
-            [الشرح]: استخدام صيغة Causative في الزمن الماضي (Subject + had + object + V3).
-            """)
-            st.markdown(f"""
-            <div class="activity-card" style="direction: ltr; text-align: left; font-family: sans-serif;">
-                <pre style="white-space: pre-wrap; font-family: inherit; margin: 0; padding: 0;">{cleaned_snippet}</pre>
-            </div>
-            """, unsafe_allow_html=True)
+        tts = gTTS(text=clean_text, lang=lang, slow=False)
+        fp = io.BytesIO()
+        tts.write_to_fp(fp)
+        fp.seek(0)
+        return fp
+    except Exception as e:
+        st.error(f"خطأ في توليد الصوت: {e}")
+        return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def books_cached():
+    return catalog.list_books()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def tracks_cached():
+    return catalog.list_tracks()
+
+
+try:
+    books = books_cached()
+    tracks = tracks_cached()
+except Exception as e:  # noqa: BLE001
+    st.error(f"تعذّر قراءة جدول الكتب: {e}")
+    st.stop()
+
+user = auth_ui.require_login()
+role = user["role"]   # "student" | "teacher" | "supervisor" | "admin"
+
+if role == "admin":
+    with st.sidebar.expander("🤖 حالة نماذج الذكاء الاصطناعي"):
+        import rag as _rag
+        for _m, _st in _rag.model_status():
+            st.write(f"{_m}: {_st}")
+        st.caption(f"آخر نموذج أجاب: {_rag.LAST_USED[0] or '—'} — يُضاف نموذج بديل بمتغير GEMINI_FALLBACK_MODELS.")
+    admin_view = st.sidebar.radio("عرض المدير", ["📚 استخدام المنصة", "👑 إدارة الحسابات"])
+    if admin_view == "👑 إدارة الحسابات":
+        auth_ui.render_admin_accounts_panel(user)
+        st.stop()
+
+scope = acc.teacher_scope(user["id"]) if role in ("teacher", "supervisor") else []
+grade_options = acc.grade_options(user, books, scope)
+if not grade_options:
+    msg = ("لم تُحدَّد لصفك مواد بعد." if role == "student" else
+          "لم تُعتمد لك أي مباحث/صفوف بعد. يرجى التواصل مع الإدارة.")
+    st.info(msg)
+    st.stop()
+
+# ---- الصف → الفصل → التخصص (للصفوف 10-12) → المادة
+c1, c2 = st.columns(2)
+if role == "student":
+    grade = user["grade"]
+    c1.markdown(f"**الصف الدراسي:** الصف {grade}")
+else:
+    grade = c1.selectbox("الصف الدراسي", grade_options, format_func=lambda g: f"الصف {g}")
+sem = c2.selectbox("الفصل الدراسي", [1, 2], format_func=lambda s: "الأول" if s == 1 else "الثاني")
+
+track_id, track = None, ""
+grade_tracks = acc.tracks_for_user(user, tracks, grade, scope=scope)
+if grade_tracks:
+    if role == "student":
+        track_id, track = grade_tracks[0]["id"], grade_tracks[0]["name"]
+        st.markdown(f"**التخصص:** {track}")
+    else:
+        track = st.selectbox("التخصص", [t["name"] for t in grade_tracks], key=f"track_{grade}")
+        track_id = next(t["id"] for t in grade_tracks if t["name"] == track)
+elif role == "student" and catalog.tracks_of_grade(tracks, grade):
+    st.info("لم يُحدَّد تخصصك بعد. يرجى التواصل مع الإدارة لإكمال بيانات حسابك.")
+    st.stop()
+elif role != "student" and catalog.tracks_of_grade(tracks, grade):
+    st.info("لا توجد تخصصات معتمدة لك في هذا الصف. يرجى التواصل مع الإدارة.")
+    st.stop()
+
+pool = acc.books_in_context(user, books, grade, track_id, scope)
+subjects = [b for b in pool if b["semester"] == sem and not catalog.is_companion(b)]
+if not subjects:
+    st.info("لم تُضف مواد هذا الصف/التخصص/الفصل بعد، أو لا تملك صلاحية عليها.")
+    st.stop()
+
+# المواد المشتركة بين تخصصات الصف تُوسَم بعلامة كي يعرف المستخدم أنها ليست خاصة بتخصصه
+subject_labels = {b["subject"]: b["subject"] + (" (مشترك)" if track_id and catalog.is_common(b) else "")
+                  for b in subjects}
+subject = st.selectbox("المادة", list(subject_labels), format_func=lambda s: subject_labels[s])
+book = next(b for b in subjects if b["subject"] == subject)
+slug = book["slug"]
+lang = book["lang"]   # "ar" | "en" — كتب الإنجليزية تُنتَج لها خطط وتحليل بالإنجليزية واتجاه LTR
+ctx = profile_ctx.build(user, grade, track, subject, sem)
+grade_label = f"الصف {grade}" + (f" {track}" if track else "")
+
+try:
+    with st.spinner("جارٍ تجهيز الكتاب..."):
+        if ingest.ensure_index(book):
+            load_index.cache_clear()
+except RuntimeError as e:
+    st.error(str(e))
+    st.stop()
+
+idx = load_index(grade, sem, slug)
+if idx is None:
+    st.error("تعذّرت معالجة الكتاب.")
+    st.stop()
+
+meta = idx[2]
+if meta.get("scanned_ratio", 0) > 0.3:
+    st.warning(
+        f"⚠️ نحو {round(meta['scanned_ratio']*100)}% من صفحات هذا الكتاب صور بلا نص قابل للقراءة "
+        "(كتاب ممسوح ضوئيًا)، لذلك قد تكون الإجابات ناقصة في تلك الأجزاء.")
+
+units = catalog.compute_units(book["units"], book["page_offset"], meta.get("pages", 0))
+flat_lessons = [
+    {"label": f"{u['title'].split(':')[0]}: {l['title']}", "title": l["title"], "start": l["start"],
+     "end": l["end"], "unit_title": u["title"]}
+    for u in units for l in u["lessons"]
+]
+comp_book = companion.attach(books, book, flat_lessons, lang)   # lang لكل درس + ربط تمارين الكتاب المرافق (إن وُجد)
+comp_idx = None
+if comp_book:
+    try:
+        comp_idx = load_index(comp_book["grade"], comp_book["semester"], comp_book["slug"])
+    except Exception:  # noqa: BLE001
+        comp_idx = None
+if not units:
+    st.info("لم تُدخل وحدات ودروس هذا الكتاب بعد من صفحة الإدارة.")
+
+if "action" not in st.session_state or st.session_state.get("action_book") != slug:
+    st.session_state.action = None
+    st.session_state.action_book = slug
+
+st.markdown("#### ماذا تريد أن تفعل؟")
+if role == "student":
+    b1, b2, b3 = st.columns(3)
+    if b1.button("📖\n\nاشرح لي"):
+        st.session_state.action = "explain"
+    if b2.button("📝\n\nقيّمني"):
+        st.session_state.action = "quiz"
+    if b3.button("📜\n\nأسئلة وزارية"):
+        st.session_state.action = "ministry"
+else:
+    r1_col1, r1_col2, r1_col3 = st.columns(3)
+    if r1_col1.button("🧾\n\nإنشاء اختبار"):
+        st.session_state.action = "exam"
+    if r1_col2.button("🗒️\n\nخطة درس"):
+        st.session_state.action = "plan"
+    if r1_col3.button("📅\n\nالخطة الفصلية"):
+        st.session_state.action = "semester_plan"
+
+    r2_col1, r2_col2, r2_col3 = st.columns(3)
+    if r2_col1.button("📊\n\nتحليل المحتوى"):
+        st.session_state.action = "content_analysis"
+    if r2_col2.button("🧑‍🏫\n\nمساعد الشرح"):
+        st.session_state.action = "teach_help"
+    if r2_col3.button("💻\n\nعرض تقديمي"):
+        st.session_state.action = "slides"
+
+    r3_col1, r3_col2, r3_col3 = st.columns(3)
+    if r3_col1.button("📋\n\nدفتر الحضور والغياب"):
+        st.session_state.action = "attendance"
+    if r3_col3.button("📒\n\nدفتر العلامات"):
+        st.session_state.action = "marks_book"
+    if role in ("supervisor", "admin"):   # المعلم العادي لا يملك صلاحية بنك الأسئلة
+        if r3_col2.button("🏦\n\nبنك الأسئلة"):
+            st.session_state.action = "qbank"
+
+    r4_col1, _r4b, _r4c = st.columns(3)
+    if r4_col1.button("📜\n\nأسئلة وزارية"):
+        st.session_state.action = "ministry"
+
+action = st.session_state.action
+if not action:
+    st.stop()
+
+st.divider()
+
+# ---- الحساب التجريبي: الخدمات المقفلة
+TRIAL_FEATURE_OF = {"exam": "exam", "plan": "lesson_plan", "semester_plan": "semester_plan",
+                    "content_analysis": "content_analysis", "teach_help": "teach_help", "slides": "slides",
+                    "attendance": "attendance", "marks_book": "marks_book"}
+if acc.is_trial(user) and action in TRIAL_FEATURE_OF and acc.trial_remaining(user, TRIAL_FEATURE_OF[action]) == 0:
+    st.warning("🔒 هذه الخدمة غير متاحة في الحساب التجريبي (أو استنفدت حصتك منها). "
+               "للحصول على كامل الميزات يرجى التواصل مع الإدارة لترقية حسابك.")
+    st.stop()
+
+
+@st.cache_data(ttl=7 * 24 * 3600, max_entries=500, show_spinner=False)
+def cached_answer(book_key, topic, pages, request, _idx, extras_json="", book_lang="ar", subject="", grade=""):
+    ctx_pages = select_context(_idx, f"{topic} {request}".strip(), pages)
+    extras = json.loads(extras_json) if extras_json else None
+    return answer(get_client(), request, ctx_pages, extras, book_lang, subject, grade), ctx_pages
+
+
+# ---------------------------------------------------------------- اشرح لي
+# ---- اتجاه النص في «اشرح لي» و«قيّمني»: الإنجليزية من اليسار لليمين والعربية من اليمين لليسار
+# الواجهة عمومًا RTL؛ هنا نجعل اتجاه الأساس حسب لغة الكتاب (إنجليزي ← LTR)، وكل فقرة/خيار/سطر يتبع لغته تلقائيًا
+# (unicode-bidi: plaintext) فتبقى الشروح العربية لكتاب إنجليزي مضبوطة أيضًا. يُطبَّق على كل ما يلي العلامة في الصفحة.
+if action in ("explain", "quiz"):
+    _base, _side = ("ltr", "left") if lang == "en" else ("rtl", "right")
+    _S = ':is([data-testid="stElementContainer"], .element-container):has(#bidi-marker) ~ ' \
+         ':is([data-testid="stElementContainer"], .element-container)'
+    st.markdown(
+        f"""<div id="bidi-marker"></div><style>
+{_S}, {_S} * {{ direction: {_base} !important; }}
+{_S} :is(p, li, h1, h2, h3, h4, h5, h6, td, th, blockquote, label) {{ unicode-bidi: plaintext !important; text-align: start !important; }}
+{_S} :is(textarea, input) {{ direction: {_base} !important; text-align: {_side} !important; unicode-bidi: plaintext !important; }}
+.stApp:has(#bidi-marker) [data-testid="stChatInput"] textarea {{ direction: {_base} !important; unicode-bidi: plaintext !important; text-align: start !important; }}
+</style>""", unsafe_allow_html=True)
+
+if action == "explain":
+    ALL_BOOK, WHOLE_UNIT = "كل الكتاب", "الوحدة كاملة"
+    pages, topic, unit_name = None, "", ALL_BOOK
+    scope_titles = []          # دروس النطاق المختار (لجلب تمارين الأنشطة والأسئلة الوزارية وشرح القواعد)
+    if units:
+        unit_titles = [ALL_BOOK] + [u["title"] for u in units]
+        unit_name = st.selectbox("الوحدة", unit_titles)
+        if unit_name != ALL_BOOK:
+            unit = units[unit_titles.index(unit_name) - 1]
+            lesson_titles = [WHOLE_UNIT] + [l["title"] for l in unit["lessons"]]
+            lesson = st.selectbox("الدرس", lesson_titles)
+            if lesson == WHOLE_UNIT:
+                pages, topic = (unit["start"], unit["end"]), unit_name
+                scope_titles = [x["title"] for x in unit["lessons"]]
+            else:
+                l = unit["lessons"][lesson_titles.index(lesson) - 1]
+                pages, topic = (l["start"], l["end"]), lesson
+                scope_titles = [lesson]
             
-    if explain_btn and query.strip():
-        with st.spinner("جاري المعالجة وتوليد الشرح النموذجي..."):
-            result = get_explanation(
-                grade=grade,
-                subject=subject,
-                book_type=book_type,
-                query=query
-            )
-            render_explanation_ui(result)
+            max_allowed_pages = 20
+            page_count = pages[1] - pages[0] + 1
+            if page_count > max_allowed_pages:
+                st.info(f"💡 تم تحديد الاستعلام بأول {max_allowed_pages} صفحة من هذا الدرس لضمان دقة الشرح.")
+                pages = (pages[0], pages[0] + max_allowed_pages - 1)
+            
+            st.caption(f"صفحات الملف المحددة للشرح: {pages[0]} – {pages[1]}")
 
-# ----------------- تبويب بنك الأسئلة -----------------
-with tabs[1]:
-    st.subheader("❓ بنك الأسئلة ونماذج الاختبارات المعتمدة")
-    st.write(f"توليد اختبارات لمادة **{subject}** للصف **{grade}** وفق مواصفات جدول المواصفات الوزاري.")
-    col_q1, col_q2 = st.columns(2)
-    with col_q1:
-        q_count = st.slider("عدد الأسئلة المطلوبة", min_value=3, max_value=20, value=5)
-    with col_q2:
-        q_diff = st.selectbox("مستوى الصعوبة", options=["سهل (مفاهيم)", "متوسط (تطبيق وفهم)", "متقدم (نمط التوجيهي)"])
-    if st.button("إنشاء نموذج الاختبار"):
-        st.success(f"تم توليد {q_count} أسئلة بنجاح متوافقة مع منهاج وزارة التربية والتعليم.")
+    # إعدادات الشرح (فوق شريط الإدخال)
+    col_lang, col_tts = st.columns(2)
+    with col_lang:
+        lang_choice = st.radio("لغة الشرح وقراءة الصوت:", ["العربية", "English"], horizontal=True)
+        lang_code = 'ar' if lang_choice == "العربية" else 'en'
+    with col_tts:
+        enable_tts = st.checkbox("🔊 تفعيل قراءة الإجابة بصوت المعلم", value=True)
 
-# ----------------- باقي التبويبات -----------------
-with tabs[2]:
-    st.subheader("📚 فهرس الكتب والمناهج المدرسية")
-    st.write(f"فهرس كتاب **{subject}** - **{grade}**.")
+    # سجل المحادثة (للعرض فقط؛ لا يُرسل إلى Gemini حتى تبقى الأسئلة قابلة للتخزين المؤقت)
+    history = st.session_state.setdefault("explain_chat", [])
+    if history and st.button("🗑️ مسح المحادثة", key="explain_clear_chat"):
+        history.clear()
+        st.rerun()
 
-with tabs[3]:
-    st.subheader("📝 خطة الدرس اليومية والخطة الفصلية")
-    st.write("إعداد الخطط التعليمية وفق النموذج الرسمي لوزارة التربية والتعليم الأردنية.")
+    for i, msg in enumerate(history):
+        with st.chat_message(msg["role"]):
+            if msg.get("image") is not None:
+                st.image(msg["image"], width=260)
+            rich_text.show(msg["content"], "ltr" if lang == "en" else "rtl")
+            if msg.get("ctx_pages"):
+                with st.expander("صفحات الكتاب المستخدمة في الإجابة"):
+                    for p in msg["ctx_pages"]:
+                        st.caption(f"صفحة {p['page']}")
+                        rich_text.show_page_text(p["text"])
+            if msg.get("audio"):
+                st.audio(msg["audio"], format="audio/mp3")
+            if msg.get("ext_row"):                       # شرح مفصّل من مصادر خارجية (مع رسوم توضيحية)
+                st.divider()
+                st.markdown("#### 📚 شرح مفصّل من مصادر خارجية")
+                grammar_ext.show(msg["ext_row"])
+            if msg.get("followup_state") == "ask":       # سؤال قواعد أُجيب من المنهاج: هل يكفي؟
+                st.markdown("**هل كان الشرح كافيًا؟**")
+                b_yes, b_no = st.columns(2)
+                if b_yes.button("✅ نعم، كافٍ", key=f"fu_yes_{i}"):
+                    msg["followup_state"] = "done"
+                    st.rerun()
+                if b_no.button("❌ لا، أريد شرحًا أوسع", key=f"fu_no_{i}"):
+                    with st.spinner("جارٍ البحث في مصادر خارجية وإعداد شرح مفصّل مع الأمثلة والرسوم..."):
+                        ext = explain_ctx.external(slug, idx, flat_lessons, msg["followup"])
+                    msg["followup_state"] = "done"
+                    if ext:
+                        msg["ext_row"] = ext
+                    else:
+                        msg["content"] += "\n\n*(تعذّر الحصول على شرح من مصادر خارجية الآن. حاول مرة أخرى بعد قليل.)*"
+                    st.rerun()
 
-with tabs[4]:
-    st.subheader("📊 مصفوفة تحليل المحتوى")
-    st.write("تحليل محتوى المنهاج: المفاهيم، الحقائق، التعميمات، المهارات، والقيم.")
+    # ---- شريط الإدخال الموحّد: + (صورة/ملف نصي) | نص | 🎤 (تسجيل صوتي)
+    prompt = st.chat_input(
+        "اكتب سؤالك هنا…",
+        accept_file=True,
+        file_type=["png", "jpg", "jpeg", "txt"],
+        accept_audio=True,
+        key="explain_chat_input",
+    )
+
+    if prompt:
+        for _m in history:
+            if _m.get("followup_state") == "ask":
+                _m["followup_state"] = "done"
+        typed_text = (getattr(prompt, "text", "") or "").strip()
+        files = list(getattr(prompt, "files", None) or [])
+        audio_file = getattr(prompt, "audio", None)
+
+        uploaded_image, file_text_prompt, input_error = None, "", None
+
+        # المرفقات
+        for f in files:
+            if f.size > 5 * 1024 * 1024:
+                input_error = "❌ حجم الملف كبير جداً. الحد الأقصى المسموح به هو 5MB."
+                break
+            if f.type == "text/plain":
+                try:
+                    file_text_prompt = f.read().decode("utf-8")[:2000]
+                except Exception as e:  # noqa: BLE001
+                    input_error = f"تعذر قراءة النص: {e}"
+            else:
+                try:
+                    uploaded_image = Image.open(f)
+                except Exception as e:  # noqa: BLE001
+                    input_error = f"تعذر فتح الصورة: {e}"
+
+        # التسجيل الصوتي → نص (نفس طريقة التفريغ السابقة)
+        voice_text = ""
+        if audio_file is not None and not input_error:
+            with st.spinner("جارٍ تحويل كلامك الصوتي إلى نص..."):
+                try:
+                    audio_part = types.Part.from_bytes(data=audio_file.getvalue(), mime_type="audio/wav")
+                    auth_ui.require_quota_or_stop(user)
+                    client = get_client()   # يجب الاحتفاظ بالمتغير وإلا يُغلق الاتصال أثناء الطلب
+                    res = client.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=[
+                            "أنت محول صوت إلى نص. قم بتفريغ المقطع الصوتي حرفياً باللغة العربية بدون إضافة أي مقدمات:",
+                            audio_part
+                        ]
+                    )
+                    if res.text:
+                        voice_text = re.sub(r'^(النص|التفريغ|الكلام المنطوق):?\s*', '', res.text.strip(),
+                                            flags=re.IGNORECASE).strip(' "\'')
+                except Exception as e:  # noqa: BLE001
+                    input_error = f"حدث خطأ أثناء قراءة الصوت: {e}"
+
+        final_prompt = "\n".join(t for t in (typed_text, voice_text, file_text_prompt) if t).strip()
+
+        if input_error:
+            st.error(input_error)
+        elif not final_prompt and not uploaded_image:
+            st.warning("يرجى كتابة سؤال، التسجيل بصوتك، أو رفع صورة/ملف تحتوي على السؤال أولاً.")
+        else:
+            history.append({"role": "user", "content": final_prompt or "📷 (صورة بدون نص)",
+                            "image": uploaded_image})
+            with st.chat_message("user"):
+                if uploaded_image is not None:
+                    st.image(uploaded_image, width=260)
+                st.markdown(final_prompt or "📷 (صورة بدون نص)")
+
+            with st.chat_message("assistant"):
+                with st.spinner("جارٍ إعداد الإجابة للشرح من المنهاج..."):
+                    try:
+                        if uploaded_image:
+                            auth_ui.require_quota_or_stop(user)
+                            sys_instruction = "أنت معلم خبير أردني. اشرح وحل الأسئلة الموضحة في الصورة بأسلوب تعليمي واصل ومبسط بلسان معلم ذكر."
+                            if lang_code == 'en':
+                                sys_instruction = "You are an expert male tutor. Solve and explain the questions in the attached image clearly."
+                            prompt_text = final_prompt if final_prompt else "قم بحل وشرح الأسئلة الموضحة في الصورة."
+                            client = get_client()
+                            response = client.models.generate_content(
+                                model=GEMINI_MODEL,
+                                contents=[uploaded_image, prompt_text],
+                                config=types.GenerateContentConfig(system_instruction=sys_instruction, temperature=0.3)
+                            )
+                            text, ctx_pages = response.text, []
+                        else:
+                            auth_ui.require_quota_or_stop(user)   # ملاحظة: يُحتسب لكل سؤال حر؛ راجع تعليق التكامل
+                            q_topic, q_pages, q_scope, t_en, followup, ext_row = topic, pages, scope_titles, None, None, None
+                            if lang == "en":
+                                # كتاب إنجليزي: نحدد بالإنجليزية موضوع السؤال (وهل هو قاعدة) فنبحث عنه في الكتاب كله ولو كان
+                                # خارج الدرس المختار (مثال: سؤال عربي عن «الماضي التام المستمر» والدرس المختار من وحدة أخرى)
+                                route = explain_ctx.route(final_prompt)
+                                if route.get("keywords_en"):
+                                    q_topic = f"{topic} {route['keywords_en']}".strip()
+                                if route.get("is_grammar"):
+                                    t_en = route["topic_en"]
+                                    followup = {"kind": "topic", "topic": t_en}
+                                    if not any(t_en.lower() in t.lower() for t in scope_titles):
+                                        q_pages, q_topic = None, f"{t_en} {route.get('keywords_en', '')}".strip()
+                                        q_scope = explain_ctx.lessons_for_topic(idx, flat_lessons, q_topic)
+                                        st.caption(f"🔎 سؤال عن قاعدة «{t_en}»: بحثتُ عنها في المنهاج (الكتاب كله).")
+                                elif len(scope_titles) == 1 and sp.lesson_kind(scope_titles[0]) in grammar_ext.GRAMMAR_KINDS:
+                                    followup = {"kind": "lesson", "lesson": scope_titles[0]}
+                            extras = explain_ctx.build(slug, idx, flat_lessons, q_scope, user, lang, topic_en=t_en)
+                            # «حل سؤال رقم كذا في صفحة كذا»: نجلب الصفحة المذكورة من كتاب الطالب وكتاب الأنشطة
+                            asked = explain_ctx.asked_pages(final_prompt, idx, book["page_offset"], comp_idx,
+                                                            (comp_book or {}).get("page_offset", 0))
+                            if asked:
+                                extras["pages_asked"] = asked
+                                q_pages = None          # الصفحة المذكورة قد تقع خارج الدرس المختار
+                                followup = None
+                            text, ctx_pages = cached_answer((grade, sem, slug, book["pdf_url"]), q_topic, q_pages, final_prompt, idx,
+                                                            json.dumps(extras, ensure_ascii=False, sort_keys=True), lang,
+                                                            subject, grade)
+                            if "<<UNRELATED>>" in text:               # ليس من المبحث إطلاقًا
+                                text, ctx_pages, followup = (f"سؤالك لا يتعلق بمادة «{subject}»، ولذلك لا أستطيع الإجابة عنه هنا. "
+                                                             "اسأل عن موضوع من هذا المنهاج."), [], None
+                            if "<<NOT_IN_CURRICULUM>>" in text:      # لا شرح لهذه القاعدة في المنهاج ← مصادر خارجية تلقائيًا
+                                text, ctx_pages = "لم أجد شرحًا لهذه القاعدة في المنهاج، فبحثتُ عنها في مصادر خارجية:", []
+                                with st.spinner("جارٍ البحث في مصادر خارجية وإعداد شرح مفصّل مع الأمثلة والرسوم..."):
+                                    ext_row = explain_ctx.external(slug, idx, flat_lessons,
+                                                                   followup or {"kind": "topic", "topic": final_prompt[:80]})
+                                if not ext_row:
+                                    text += "\n\n*(تعذّر الحصول على شرح من مصادر خارجية الآن. حاول مرة أخرى بعد قليل.)*"
+                                followup = None
+
+                        rich_text.show(text, "ltr" if lang == "en" else "rtl")
+                        if uploaded_image is None and ext_row:
+                            st.divider()
+                            st.markdown("#### 📚 شرح مفصّل من مصادر خارجية")
+                            grammar_ext.show(ext_row)
+                        if ctx_pages:
+                            with st.expander("صفحات الكتاب المستخدمة في الإجابة"):
+                                for p in ctx_pages:
+                                    st.caption(f"صفحة {p['page']}")
+                                    rich_text.show_page_text(p["text"])
+
+                        audio_bytes = None
+                        if enable_tts and text:
+                            audio_fp = text_to_speech(text, lang=lang_code)
+                            if audio_fp:
+                                audio_bytes = audio_fp.getvalue()
+                                st.audio(audio_bytes, format="audio/mp3")
+
+                        entry = {"role": "assistant", "content": text, "ctx_pages": ctx_pages, "audio": audio_bytes}
+                        if uploaded_image is None and ext_row:
+                            entry["ext_row"] = ext_row
+                        if uploaded_image is None and followup:
+                            entry["followup"], entry["followup_state"] = followup, "ask"
+                        history.append(entry)
+                        del history[:-10]   # نحتفظ بآخر 10 رسائل فقط لتوفير الذاكرة
+                        if entry.get("followup_state") == "ask":
+                            st.rerun()      # لتظهر أزرار «هل كان الشرح كافيًا؟» تحت الإجابة
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"حدث خطأ أثناء معالجة الطلب: {e}")
+
+# ---------------------------------------------------------------- قيّمني
+elif action == "quiz":
+    if not flat_lessons:
+        st.info("لم تُدخل دروس هذا الكتاب بعد.")
+    else:
+        selected = st.multiselect(
+            "اختر درسًا أو أكثر (يمكن الجمع بين دروس من وحدات مختلفة)",
+            [l["label"] for l in flat_lessons], default=[flat_lessons[0]["label"]])
+        chosen = [l for l in flat_lessons if l["label"] in selected]
+        render_quiz(idx, slug, chosen)
+
+# ---------------------------------------------------------------- إنشاء اختبار (المعلم)
+elif action == "exam":
+    render_exam_builder(idx, slug, subject, sem, flat_lessons, ctx=ctx, user=user)
+
+# ---------------------------------------------------------------- خطة الدرس (المعلم)
+elif action == "plan":
+    render_lesson_plan_builder(idx, slug, subject, flat_lessons, user=user, ctx=ctx, lang=lang)
+
+# ---------------------------------------------------------------- الخطة الفصلية للمنهاج كاملًا (المعلم)
+elif action == "semester_plan":
+    if not units:
+        st.info("لم تُدخل وحدات هذا الكتاب بعد.")
+    else:
+        render_semester_plan_builder(idx, slug, subject, units, flat_lessons=flat_lessons, user=user, ctx=ctx,
+                                     lang=lang)
+
+# ---------------------------------------------------------------- تحليل المحتوى للمنهاج كاملًا (المعلم)
+elif action == "content_analysis":
+    if not units:
+        st.info("لم تُدخل وحدات هذا الكتاب بعد.")
+    else:
+        render_content_analysis_builder(idx, slug, subject, units, user=user, ctx=ctx, lang=lang)
+
+# ---------------------------------------------------------------- العرض التقديمي (PPTX)
+elif action == "slides":
+    render_slides_builder(idx, slug, subject, flat_lessons, user=user)
+
+# ---------------------------------------------------------------- مساعد الشرح (دليل المعلم)
+elif action == "teach_help":
+    render_teach_help_builder(idx, slug, subject, flat_lessons, grade_label=grade_label, user=user)
+
+# ---------------------------------------------------------------- بنك الأسئلة (المعلم)
+elif action == "attendance":
+    render_attendance_builder(user, ctx=ctx)
+
+elif action == "marks_book":
+    render_marks_book_builder(user, ctx=ctx)
+
+elif action == "qbank":
+    if role not in ("supervisor", "admin"):
+        st.error("لا تملك صلاحية الوصول إلى بنك الأسئلة.")
+        st.stop()
+    render_qbank_builder(idx, slug, subject, flat_lessons,
+                        subject_scope=acc.qbank_subject_scope(user), user=user)
+
+elif action == "ministry":
+    render_ministry(book, flat_lessons, user, lang, idx)
+
+# ---------------------------------------------------------------- الشروط الاحتياطية
+else:
+    st.info("يرجى اختيار إجراء من القائمة أعلاه.")
