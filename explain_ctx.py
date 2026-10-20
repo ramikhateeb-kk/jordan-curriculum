@@ -92,6 +92,40 @@ def lessons_for_topic(idx, flat_lessons, query, limit=2):
     return [t for _s, t in sorted(scored, key=lambda x: -x[0])[:limit]]
 
 
+
+def find_title_pages(question, idx):
+    """يعثر على الصفحات التي يظهر فيها عنوان/عبارة إنجليزية ذكرها الطالب صراحةً."""
+    q = str(question or "")
+    # التقط العبارة الإنجليزية بعد «نص»/«عنوان» أو داخل علامات اقتباس.
+    candidates = re.findall(r"[\"'“”‘’]([^\"'“”‘’]{3,100})[\"'“”‘’]", q)
+    if not candidates:
+        m = re.search(r"(?:نص|عنوان|text|title)\s+(.+?)(?=\s+(?:في|صفحة|بالصفحة|page)\b|$)", q, re.I)
+        if m:
+            candidates = [m.group(1)]
+    stop = {"they", "need", "saving", "too", "the", "text", "words", "word", "highlighted", "meaning", "معنى", "الكلمات", "المظللة"}
+    # نحتفظ بعبارات إنجليزية كاملة، مع تجربة العبارة الأصلية أولاً.
+    phrases = []
+    for c in candidates:
+        words = re.findall(r"[a-z]+", c.lower())
+        if len(words) >= 2:
+            phrases.append(" ".join(words))
+    if not phrases:
+        # عنوان معروف مذكور بلا علامات اقتباس في سؤال شائع.
+        words = re.findall(r"[a-z]+", q.lower())
+        for n in range(min(8, len(words)), 1, -1):
+            phrase = " ".join(words[-n:])
+            if phrase not in {"the student", "student book"}:
+                phrases.append(phrase)
+    pages = []
+    for page in idx[0]:
+        text = re.sub(r"[^a-z0-9]+", " ", str(page.get("text", "")).lower()).strip()
+        for phrase in phrases:
+            if phrase and re.sub(r"[^a-z0-9]+", " ", phrase).strip() in text:
+                pages.append(int(page["page"]))
+                break
+    return sorted(set(pages))
+
+
 _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _PAGE_RX = re.compile(r"(?<!\w)(?:صفحة|صفحه|الصفحة|ص|page|p)\.?\s*[:\-]?\s*(\d{1,3})(?!\d)", re.I)
 

@@ -373,6 +373,7 @@ if action == "explain":
                     st.rerun()
 
     # ---- شريط الإدخال الموحّد: + (صورة/ملف نصي) | نص | 🎤 (تسجيل صوتي)
+    st.caption("يعتمد الشرح أولًا على كتاب الطالب والكتب المرافقة. إذا لم يتضح النص أو الدرس، سيطلب المساعد توضيحًا بدل تخمين المصدر أو استخدام أمثلة خارجية.")
     prompt = st.chat_input(
         "اكتب سؤالك هنا…",
         accept_file=True,
@@ -430,6 +431,14 @@ if action == "explain":
 
         final_prompt = "\n".join(t for t in (typed_text, voice_text, file_text_prompt) if t).strip()
 
+        # إذا كان آخر رد للمساعد سؤالًا توضيحيًا، اربط إجابة الطالب بالطلب الأصلي بدل التعامل معها كسؤال جديد منفصل.
+        if final_prompt and len(history) >= 2 and history[-1].get("role") == "assistant" and history[-2].get("role") == "user":
+            _last_assistant = str(history[-1].get("content", ""))
+            _clarification_markers = ("ما اسم الوحدة", "في أي صفحة", "أي درس", "أرسل صورة الصفحة", "حدد الوحدة", "هل يمكنك تحديد", "ما عنوان النص")
+            if any(marker in _last_assistant for marker in _clarification_markers):
+                _original_request = str(history[-2].get("content", "")).strip()
+                final_prompt = f"الطلب الأصلي للطالب: {_original_request}\nتوضيح الطالب ردًا على السؤال السابق: {final_prompt}\nتابع تنفيذ الطلب الأصلي باستخدام هذا التوضيح، ولا تعتبر التوضيح طلبًا منفصلًا."
+
         if input_error:
             st.error(input_error)
         elif not final_prompt and not uploaded_image:
@@ -480,24 +489,48 @@ if action == "explain":
                             # «حل سؤال رقم كذا في صفحة كذا»: نجلب الصفحة المذكورة من كتاب الطالب وكتاب الأنشطة
                             asked = explain_ctx.asked_pages(final_prompt, idx, book["page_offset"], comp_idx,
                                                             (comp_book or {}).get("page_offset", 0))
+                            requested_page = explain_ctx.parse_page(final_prompt)
                             if asked:
                                 extras["pages_asked"] = asked
-                                q_pages = None          # الصفحة المذكورة قد تقع خارج الدرس المختار
+                                # مهم: لا نبحث في الكتاب كله بعد العثور على الصفحة؛ نقيّد الاسترجاع بالصفحة نفسها.
+                                internal_pages = []
+                                for item in asked:
+                                    off = (comp_book or {}).get("page_offset", 0) if item["source"] == "كتاب الأنشطة" else book["page_offset"]
+                                    internal_pages.append(int(item["page"]) + int(off))
+                                q_pages = (min(internal_pages), max(internal_pages)) if internal_pages else q_pages
+                                q_topic = f"{q_topic} {final_prompt}".strip()
                                 followup = None
-                            text, ctx_pages = cached_answer((grade, sem, slug, book["pdf_url"]), q_topic, q_pages, final_prompt, idx,
-                                                            json.dumps(extras, ensure_ascii=False, sort_keys=True), lang,
-                                                            subject, grade)
+                            elif requested_page is not None:
+                                # رقم الصفحة صريح لكن لا يوجد نص مطابق: لا نسمح بالبحث العشوائي في صفحات أخرى.
+                                text = (f"لم أتمكن من العثور على نص صفحة {requested_page} في الملف المفهرس لكتاب الطالب/الأنشطة. "
+                                        "حتى لا أترجم أو أشرح نصًا مختلفًا، أرسل صورة الصفحة أو انسخ الفقرة/الكلمات المطلوبة هنا.")
+                                ctx_pages = []
+                            else:
+                                # عند ذكر عنوان نص أو طلب كلمات مظللة، ابحث عن العنوان حرفيًا أولًا.
+                                ql = final_prompt.lower()
+                                if any(k in ql for k in ("المظللة", "المظلله", "highlighted", "highlighted words", "معنى الكلمات")):
+                                    title_pages = explain_ctx.find_title_pages(final_prompt, idx)
+                                    if title_pages:
+                                        # نضم الصفحة التي تحمل العنوان والصفحة التالية فقط؛ لا ننتقل لمقال مشابه بعيد.
+                                        lo, hi = min(title_pages), max(title_pages)
+                                        q_pages = (lo, min(hi + 1, max(p["page"] for p in idx[0])))
+                                        q_topic = f"{q_topic} {final_prompt}".strip()
+                            if requested_page is not None and not asked:
+                                pass
+                            else:
+                                text, ctx_pages = cached_answer((grade, sem, slug, book["pdf_url"]), q_topic, q_pages, final_prompt, idx,
+                                                                json.dumps(extras, ensure_ascii=False, sort_keys=True), lang,
+                                                                subject, grade)
                             if "<<UNRELATED>>" in text:               # ليس من المبحث إطلاقًا
                                 text, ctx_pages, followup = (f"سؤالك لا يتعلق بمادة «{subject}»، ولذلك لا أستطيع الإجابة عنه هنا. "
                                                              "اسأل عن موضوع من هذا المنهاج."), [], None
-                            if "<<NOT_IN_CURRICULUM>>" in text:      # لا شرح لهذه القاعدة في المنهاج ← مصادر خارجية تلقائيًا
-                                text, ctx_pages = "لم أجد شرحًا لهذه القاعدة في المنهاج، فبحثتُ عنها في مصادر خارجية:", []
-                                with st.spinner("جارٍ البحث في مصادر خارجية وإعداد شرح مفصّل مع الأمثلة والرسوم..."):
-                                    ext_row = explain_ctx.external(slug, idx, flat_lessons,
-                                                                   followup or {"kind": "topic", "topic": final_prompt[:80]})
-                                if not ext_row:
-                                    text += "\n\n*(تعذّر الحصول على شرح من مصادر خارجية الآن. حاول مرة أخرى بعد قليل.)*"
-                                followup = None
+                            if "<<NOT_IN_CURRICULUM>>" in text:
+                                # لا ننتقل إلى أمثلة خارجية تلقائيًا؛ نحافظ على مفردات المنهاج ونطلب توضيحًا مفيدًا.
+                                text, ctx_pages, followup, ext_row = (
+                                    "لم أجد في النصوص المتاحة شرحًا كافيًا لهذه القاعدة أو أمثلة مؤكدة من المنهاج. "
+                                    "حتى أشرحها باستخدام مفردات وأمثلة يعرفها الطالب، ما اسم الوحدة أو الدرس الذي وردت فيه؟ "
+                                    "يمكنك أيضًا إرسال صورة الصفحة أو تحديد صفحة القاعدة في كتاب الطالب أو الكتاب المرافق.",
+                                    [], None, None)
 
                         rich_text.show(text, "ltr" if lang == "en" else "rtl")
                         if uploaded_image is None and ext_row:
