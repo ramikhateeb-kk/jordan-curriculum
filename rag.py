@@ -41,7 +41,7 @@ SYSTEM = (
 # ------------------------------------------------------------ الانتقال التلقائي بين نماذج Gemini
 # عند تجاوز الحد المسموح (429) أو انشغال الخدمة (503) أو عدم وجود النموذج (404) يُجرَّب النموذج التالي في السلسلة تلقائيًا.
 # السلسلة: GEMINI_MODEL ثم GEMINI_FALLBACK_MODELS (أسماء مفصولة بفواصل في متغير بيئة أو في secrets). لكل نموذج حصة مستقلة غالبًا.
-_DEFAULT_FALLBACKS = "gemini-2.5-flash-lite,gemini-2.0-flash"
+_DEFAULT_FALLBACKS = "gemini-3.8-flash,gemini-2.5-flash-lite"
 _COOL = {}                       # نموذج -> وقت انتهاء فترة الراحة
 _LOCK = threading.Lock()
 LAST_QUOTA = [0.0]               # آخر مرة فشلت فيها كل النماذج بسبب الحد المسموح
@@ -56,12 +56,17 @@ def _fallbacks():
             raw = st.secrets.get("GEMINI_FALLBACK_MODELS")
         except Exception:
             raw = None
-    return [m.strip() for m in (raw if raw is not None else _DEFAULT_FALLBACKS).split(",") if m.strip()]
+    models = [m.strip() for m in (raw if raw is not None else _DEFAULT_FALLBACKS).split(",") if m.strip()]
+    # أزيل نموذج Gemini 2.0 Flash المتوقف، حتى لو كان موجودًا في إعدادات Streamlit القديمة.
+    return list(dict.fromkeys("gemini-3.8-flash" if m.lower().removeprefix("models/") == "gemini-2.0-flash" else m for m in models))
 
 
 def model_chain(primary=None):
     """النماذج بترتيب التجربة: ما ليس في فترة راحة أولًا، ثم الباقي حسب أقرب انتهاء للراحة (فلا نتوقف إن كانت كلها مرهقة)."""
-    chain = list(dict.fromkeys([primary or GEMINI_MODEL] + _fallbacks()))
+    candidates = [primary or GEMINI_MODEL] + _fallbacks()
+    # قد يكون النموذج الأساسي نفسه مضبوطًا على الاسم القديم في Secrets أو Environment.
+    candidates = ["gemini-3.8-flash" if str(m).lower().removeprefix("models/") == "gemini-2.0-flash" else m for m in candidates]
+    chain = list(dict.fromkeys(candidates))
     now = time.time()
     with _LOCK:
         ready = [m for m in chain if _COOL.get(m, 0) <= now]
