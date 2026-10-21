@@ -27,7 +27,7 @@ def normalize_markdown(md):
     fixed = []
     for line in lines:
         # أحيانًا يدمج النموذج نهاية صف العناوين مع صف فواصل الجدول: | English | العربية | | :--- | :--- |
-        line = re.sub(r"\|\s*\|\s*((?::?[-]{3,}[^|]*(?:\|[^|]*)*\|?)\s*$", r"|\n| \1", line)
+        line = re.sub(r"\|\s*\|\s*(?=:?-{3,})", "|\n| ", line)
         fixed.extend(line.split("\n"))
     text = "\n".join(fixed)
     # توحيد صفوف فواصل الجداول، مع الإبقاء على الأعمدة كما كتبها النموذج.
