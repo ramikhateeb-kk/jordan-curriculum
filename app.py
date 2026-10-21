@@ -326,6 +326,16 @@ if action == "explain":
             
             st.caption(f"صفحات الملف المحددة للشرح: {pages[0]} – {pages[1]}")
 
+    # اختيار مصدر الإجابة صراحةً؛ الافتراضي كتاب الطالب لمنع خلط صفحات الكتب.
+    source_choice = st.selectbox(
+        "مصدر الإجابة",
+        ["كتاب الطالب", "كتاب الأنشطة", "جميع المصادر"],
+        index=0,
+        help="يُطبّق هذا الاختيار على استرجاع صفحات السؤال. عند اختيار كتاب واحد لن نستخدم صفحة من الكتاب الآخر للإجابة عن سؤال محدد برقم صفحة."
+    )
+    if source_choice == "كتاب الأنشطة" and not comp_idx:
+        st.warning("لا يوجد كتاب أنشطة مفهرس ومتاح لهذه المادة؛ اختر كتاب الطالب أو أضف كتاب الأنشطة من الإدارة.")
+
     # إعدادات الشرح (فوق شريط الإدخال)
     col_lang, col_tts = st.columns(2)
     with col_lang:
@@ -487,11 +497,22 @@ if action == "explain":
                                     followup = {"kind": "lesson", "lesson": scope_titles[0]}
                             extras = explain_ctx.build(slug, idx, flat_lessons, q_scope, user, lang, topic_en=t_en)
                             # «حل سؤال رقم كذا في صفحة كذا»: نجلب الصفحة المذكورة من كتاب الطالب وكتاب الأنشطة
-                            asked = explain_ctx.asked_pages(final_prompt, idx, book["page_offset"], comp_idx,
-                                                            (comp_book or {}).get("page_offset", 0))
+                            asked = explain_ctx.asked_pages(
+                                final_prompt, idx, book["page_offset"], comp_idx,
+                                (comp_book or {}).get("page_offset", 0), source_mode=source_choice
+                            )
                             requested_page = explain_ctx.parse_page(final_prompt)
                             if asked:
                                 extras["pages_asked"] = asked
+                                # عند اختيار كتاب واحد، لا نسمح لمحتوى الكتاب الآخر بالتأثير في حل السؤال.
+                                if source_choice == "كتاب الطالب":
+                                    extras["workbook"] = ""
+                                elif source_choice == "كتاب الأنشطة":
+                                    extras["workbook"] = ""
+                                    # في حال طلب كتاب الأنشطة فقط، يكون نص صفحته هو المصدر الأساسي.
+                                    extras["source_priority"] = "كتاب الأنشطة فقط"
+                                else:
+                                    extras["source_priority"] = "جميع المصادر"
                                 # مهم: لا نبحث في الكتاب كله بعد العثور على الصفحة؛ نقيّد الاسترجاع بالصفحة نفسها.
                                 internal_pages = []
                                 for item in asked:
@@ -501,8 +522,9 @@ if action == "explain":
                                 q_topic = f"{q_topic} {final_prompt}".strip()
                                 followup = None
                             elif requested_page is not None:
-                                # رقم الصفحة صريح لكن لا يوجد نص مطابق: لا نسمح بالبحث العشوائي في صفحات أخرى.
-                                text = (f"لم أتمكن من العثور على نص صفحة {requested_page} في الملف المفهرس لكتاب الطالب/الأنشطة. "
+                                # رقم الصفحة صريح لكن لا يوجد نص في المصدر المحدد: لا نسمح بالبحث في كتاب آخر أو صفحات أخرى.
+                                source_label = source_choice
+                                text = (f"لم أتمكن من العثور على نص صفحة {requested_page} في مصدر الإجابة المحدد ({source_label}). "
                                         "حتى لا أترجم أو أشرح نصًا مختلفًا، أرسل صورة الصفحة أو انسخ الفقرة/الكلمات المطلوبة هنا.")
                                 ctx_pages = []
                             else:
@@ -518,8 +540,16 @@ if action == "explain":
                             if requested_page is not None and not asked:
                                 pass
                             else:
-                                text, ctx_pages = cached_answer((grade, sem, slug, book["pdf_url"]), q_topic, q_pages, final_prompt, idx,
-                                                                json.dumps(extras, ensure_ascii=False, sort_keys=True), lang,
+                                # عند اختيار كتاب الأنشطة، يكون فهرسه هو فهرس البحث الأساسي لا فهرس كتاب الطالب.
+                                search_idx = idx
+                                search_key = (grade, sem, slug, book["pdf_url"])
+                                search_lang = lang
+                                if source_choice == "كتاب الأنشطة" and comp_idx and comp_book:
+                                    search_idx = comp_idx
+                                    search_key = (comp_book["grade"], comp_book["semester"], comp_book["slug"], comp_book["pdf_url"])
+                                    search_lang = comp_book.get("lang", lang)
+                                text, ctx_pages = cached_answer(search_key, q_topic, q_pages, final_prompt, search_idx,
+                                                                json.dumps(extras, ensure_ascii=False, sort_keys=True), search_lang,
                                                                 subject, grade)
                             if "<<UNRELATED>>" in text:               # ليس من المبحث إطلاقًا
                                 text, ctx_pages, followup = (f"سؤالك لا يتعلق بمادة «{subject}»، ولذلك لا أستطيع الإجابة عنه هنا. "

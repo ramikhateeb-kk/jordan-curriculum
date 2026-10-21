@@ -143,13 +143,19 @@ def _which_books(question):
     return (not workbook or student), (workbook or not student)
 
 
-def asked_pages(question, idx, offset, comp_idx=None, comp_offset=0):
-    """نصوص الصفحة التي ذكرها الطالب من كتاب الطالب و/أو كتاب الأنشطة: [{source, page, text}]."""
+def asked_pages(question, idx, offset, comp_idx=None, comp_offset=0, source_mode="جميع المصادر"):
+    """استرجاع الصفحة المطلوبة من مصدر الإجابة المحدد فقط، أو من المصدرين عند اختيار الجميع."""
     page = parse_page(question)
     if not page:
         return []
     from rich_text import clean_text
     use_main, use_comp = _which_books(question)
+    # اختيار الواجهة هو المرجع الحاسم؛ لا يكفي ذكر كلمة "student" داخل نص السؤال لتجاوز الاختيار.
+    if source_mode == "كتاب الطالب":
+        use_main, use_comp = True, False
+    elif source_mode == "كتاب الأنشطة":
+        use_main, use_comp = False, True
+    # في وضع "جميع المصادر" نراعي أيضًا إن كان الطالب قد سمّى كتابًا بعينه.
     out = []
     if use_main:
         for p in idx[0]:
