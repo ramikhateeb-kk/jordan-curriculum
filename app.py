@@ -278,8 +278,20 @@ if acc.is_trial(user) and action in TRIAL_FEATURE_OF and acc.trial_remaining(use
 
 @st.cache_data(ttl=7 * 24 * 3600, max_entries=500, show_spinner=False)
 def cached_answer(book_key, topic, pages, request, _idx, extras_json="", book_lang="ar", subject="", grade=""):
-    ctx_pages = select_context(_idx, f"{topic} {request}".strip(), pages)
     extras = json.loads(extras_json) if extras_json else None
+    # إذا ذكر المستخدم صفحة محددة، نمرر نص الصفحة المسترجعة نفسها فقط، ولا نعيد البحث
+    # الدلالي في صفحات أخرى قد تنتمي إلى موضوع/مادة مختلفة.
+    asked = extras.get("pages_asked", []) if isinstance(extras, dict) else []
+    if asked:
+        ctx_pages = [
+            {"page": int(item.get("page", 0)),
+             "text": f"[المصدر المحدد: {item.get('source', 'الكتاب المحدد')} | الصفحة المطبوعة: {item.get('page', '?')}]\n{item.get('text', '')}"}
+            for item in asked if str(item.get("text", "")).strip()
+        ]
+        # لا نسمح للتمارين المرافقة أو الأسئلة الوزارية بإزاحة نص الصفحة المطلوبة.
+        extras = {"source_priority": extras.get("source_priority", "المصدر المحدد فقط")} if isinstance(extras, dict) else None
+    else:
+        ctx_pages = select_context(_idx, f"{topic} {request}".strip(), pages)
     return answer(get_client(), request, ctx_pages, extras, book_lang, subject, grade), ctx_pages
 
 
@@ -326,15 +338,17 @@ if action == "explain":
             
             st.caption(f"صفحات الملف المحددة للشرح: {pages[0]} – {pages[1]}")
 
-    # اختيار مصدر الإجابة صراحةً؛ الافتراضي كتاب الطالب لمنع خلط صفحات الكتب.
+    # لا نعرض إلا المصادر المتاحة فعليًا للكتاب/المادة المحددة.
+    source_options = ["كتاب الطالب"]
+    if comp_book is not None and comp_idx is not None:
+        source_options += ["كتاب الأنشطة", "جميع المصادر"]
     source_choice = st.selectbox(
         "مصدر الإجابة",
-        ["كتاب الطالب", "كتاب الأنشطة", "جميع المصادر"],
+        source_options,
         index=0,
-        help="يُطبّق هذا الاختيار على استرجاع صفحات السؤال. عند اختيار كتاب واحد لن نستخدم صفحة من الكتاب الآخر للإجابة عن سؤال محدد برقم صفحة."
+        key=f"explain_source_{grade}_{sem}_{slug}",
+        help="تظهر الكتب المرافقة فقط إذا كان هناك كتاب مرافق مفهرس ومرتبط بالمادة الحالية."
     )
-    if source_choice == "كتاب الأنشطة" and not comp_idx:
-        st.warning("لا يوجد كتاب أنشطة مفهرس ومتاح لهذه المادة؛ اختر كتاب الطالب أو أضف كتاب الأنشطة من الإدارة.")
 
     # إعدادات الشرح (فوق شريط الإدخال)
     col_lang, col_tts = st.columns(2)
