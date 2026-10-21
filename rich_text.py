@@ -20,8 +20,24 @@ _STYLE = ("<style>.bidi-rt table{border-collapse:collapse;width:100%;margin:.4em
 _BLOCK = re.compile(r"<(p|li|h[1-6]|td|th|blockquote)(\s|>)")
 
 
+def normalize_markdown(md):
+    """إصلاح أشهر أخطاء تنسيق Markdown الصادرة عن النموذج قبل العرض."""
+    text = str(md or "").replace("\\|", "|")
+    lines = text.splitlines()
+    fixed = []
+    for line in lines:
+        # أحيانًا يدمج النموذج نهاية صف العناوين مع صف فواصل الجدول: | English | العربية | | :--- | :--- |
+        line = re.sub(r"\|\s*\|\s*((?::?[-]{3,}[^|]*(?:\|[^|]*)*\|?)\s*$", r"|\n| \1", line)
+        fixed.extend(line.split("\n"))
+    text = "\n".join(fixed)
+    # توحيد صفوف فواصل الجداول، مع الإبقاء على الأعمدة كما كتبها النموذج.
+    text = re.sub(r"(?m)^\s*\|?\s*:?-{3,}[^\n]*$", lambda m: "| " + m.group(0).strip().strip("|").strip() + " |", text)
+    return text
+
+
 def to_html(md, base="ltr"):
     """ماركداون → HTML. base: اتجاه الجداول والقوائم (ltr لكتاب إنجليزي)."""
+    md = normalize_markdown(md)
     if _md is None:
         return None
     safe = str(md).replace("&", "&amp;").replace("<", "&lt;")            # لا نسمح بـ HTML خام من النموذج
@@ -33,6 +49,7 @@ def to_html(md, base="ltr"):
 
 def show(md, base="ltr"):
     """يعرض الماركداون باتجاه صحيح لكل فقرة. يعود إلى st.markdown إن لم تتوفر مكتبة markdown."""
+    md = normalize_markdown(md)
     h = to_html(md, base)
     if h is None:
         st.markdown(md)
