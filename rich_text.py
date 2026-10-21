@@ -21,18 +21,39 @@ _BLOCK = re.compile(r"<(p|li|h[1-6]|td|th|blockquote)(\s|>)")
 
 
 def normalize_markdown(md):
-    """إصلاح أشهر أخطاء تنسيق Markdown الصادرة عن النموذج قبل العرض."""
+    """تنظيف Markdown وإصلاح الجداول المعيبة دون عرض بقايا جدول فارغ."""
     text = str(md or "").replace("\\|", "|")
     lines = text.splitlines()
     fixed = []
     for line in lines:
-        # أحيانًا يدمج النموذج نهاية صف العناوين مع صف فواصل الجدول: | English | العربية | | :--- | :--- |
+        # يفصل رأس الجدول عن صف الفواصل إذا ألصقهما النموذج في سطر واحد.
         line = re.sub(r"\|\s*\|\s*(?=:?-{3,})", "|\n| ", line)
         fixed.extend(line.split("\n"))
-    text = "\n".join(fixed)
-    # توحيد صفوف فواصل الجداول، مع الإبقاء على الأعمدة كما كتبها النموذج.
-    text = re.sub(r"(?m)^\s*\|?\s*:?-{3,}[^\n]*$", lambda m: "| " + m.group(0).strip().strip("|").strip() + " |", text)
-    return text
+
+    # توحيد صف الفواصل، مع عدم إنشاء جدول إذا لم يكن له أي صف بيانات.
+    normalized = []
+    for line in fixed:
+        stripped = line.strip()
+        if re.fullmatch(r"\|?\s*:?-{3,}(?:\s*\|\s*:?-{3,})*\s*\|?", stripped):
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            line = "| " + " | ".join(cells) + " |"
+        normalized.append(line)
+
+    # إزالة جدول أخير ناقص: رأس + فواصل فقط، بلا أي صف إجابة.
+    # يحدث هذا عندما يخرج النموذج ذيلًا مثل: | English | العربية | | :--- ...
+    i = len(normalized) - 1
+    while i >= 0 and not normalized[i].strip():
+        i -= 1
+    if i >= 0 and re.match(r"^\s*\|.*\|\s*$", normalized[i]):
+        sep = i
+        if re.fullmatch(r"\s*\|?\s*:?-{3,}[^\n]*\|?\s*", normalized[sep]):
+            j = sep - 1
+            while j >= 0 and not normalized[j].strip():
+                j -= 1
+            if j >= 0 and "|" in normalized[j] and not re.fullmatch(r"\s*\|?\s*:?-{3,}[^\n]*\|?\s*", normalized[j]):
+                # احذف الرأس والفواصل فقط إذا كانا آخر محتوى ولم يتبعهما صف بيانات.
+                normalized = normalized[:j]
+    return "\n".join(normalized).rstrip()
 
 
 def to_html(md, base="ltr"):
