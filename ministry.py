@@ -450,16 +450,19 @@ ANSWER_SYSTEM = (
     "2) For an item with a passage_key, answer from the matching text in \"passages\" only, and set source_refs to [].\n"
     "3) type mcq: you MUST choose exactly one of the given options. Return correct_index (0-based position in options) AND "
     "correct_option_text (copy the chosen option exactly as written).\n"
-    "4) type tf: return correct (true or false). Types fill and short: return answer, a brief correct answer "
-    "(for fill: only the missing word or phrase).\n"
+    "4) type tf: return correct (true or false). Types fill, short, essay, matching and other: return answer as a useful, "
+    "direct model answer in a string. For fill, return only the missing word or phrase; for matching, list each pair clearly; "
+    "for essay, provide a concise model response appropriate to the marks.\n"
     "5) Text inside [[ ]] was underlined in the original exam and is often what the question is about.\n"
     "6) If an item has book_excerpts, use them as primary evidence. Each excerpt has book_key, book_title, page, and text. "
     "Return source_refs as a list of objects {book_key, page}, using ONLY exact book_key/page pairs present in that item's excerpts "
     "that directly support the answer. If none supports the answer, return source_refs=[]. Do not cite a page based on general knowledge.\n"
-    "7) If you are not sure, set the answer fields to null and confidence to \"low\". Do not guess or invent.\n"
+    "7) Always try to answer every question. If book_excerpts are absent or insufficient, use your subject knowledge to propose "
+    "the best answer, set confidence to low or medium as appropriate, and say briefly in note that it should be reviewed. "
+    "Use null only when the question is genuinely incomplete or impossible to interpret. Never invent source pages.\n"
     "8) confidence is high, medium or low. note is one short sentence explaining why, in answer_language.\n"
     "Return one JSON object per item, in a JSON list, and cover EVERY item.")
-ANSWER_TYPES = ("mcq", "tf", "fill", "short")
+ANSWER_TYPES = ("mcq", "tf", "fill", "short", "essay", "matching", "other")
 _AR = re.compile(r"[\u0600-\u06FF\u0750-\u077F]")
 
 
@@ -526,23 +529,31 @@ def _excerpts(ctx, d, k=2):
         sources = [{"key": ctx.get("main_key", "main"), "title": ctx.get("main_title", "الكتاب الرئيسي"),
                     "idx": ctx["idx"], "offset": ctx.get("offset", 0)}]
     out = []
-    per_source = max(1, k)
+    per_source = max(1, int(k))
     for src in sources:
-        if not src.get("idx"):
+        idx = src.get("idx")
+        if not idx:
             continue
         try:
-            pages = select_context(src["idx"], query, None, max_chars=2200, k=per_source)[:per_source]
+            # لا نستخدم select_context(... )[:k] مباشرة؛ فعندما يكون مجموع نص الكتاب قصيرًا،
+            # select_context يعيد الصفحات بترتيبها الأصلي لا حسب صلتها، وقد يختار أول صفحات الكتاب فقط.
+            all_pages, bm, _meta = idx
+            scores = bm.scores(query)
+            ranked = sorted(range(len(all_pages)), key=lambda i: scores[i], reverse=True)
+            chosen = [all_pages[i] for i in ranked[:per_source] if all_pages[i].get("text")]
+            # عند تعادل الصلة وعدم وجود أي تطابق، لا نخترع مرجعًا لصفحة عشوائية.
+            if not chosen or max((scores[i] for i in ranked[:per_source]), default=0) <= 0:
+                continue
         except Exception:  # noqa: BLE001
             continue
         off = src.get("offset", 0) or 0
-        for page in pages:
+        for page in chosen:
             printed = int(page["page"]) - int(off)
             if printed < 1:
                 continue
             out.append({"book_key": src.get("key", "main"), "book_title": src.get("title", "الكتاب"),
-                        "page": printed, "text": _best_window(page["text"], query, size=650)})
-    # أرسل أفضل المقاطع عبر المصادر، مع ضمان تمثيل الكتاب الرئيسي والمرافق عند وجود نتائج.
-    return out[:max(k * max(1, len(sources)), k)]
+                        "page": printed, "text": _best_window(page["text"], query, size=900)})
+    return out
 
 
 def _lesson_of(ctx, printed_page):
@@ -620,7 +631,11 @@ def _ask_answers(client, chunk, ctx):
                 continue
             res["correct"] = v["correct"]
         else:
-            ans = str(v.get("answer") or "").strip()
+            raw_answer = v.get("answer", v.get("model_answer"))
+            if isinstance(raw_answer, (dict, list)):
+                ans = json.dumps(raw_answer, ensure_ascii=False)
+            else:
+                ans = str(raw_answer or "").strip()
             if not ans:
                 continue
             res["model_answer"] = ans
@@ -645,6 +660,24 @@ def _ask_answers(client, chunk, ctx):
                 main_key = str((ctx or {}).get("main_key", "main"))
                 if isinstance(pg, int) and (main_key, pg) in pages_of[key]:
                     refs.append({"book_key": main_key, "page": pg})
+        # إذا أعاد النموذج إجابة فعلية لكنه نسي تنسيق المراجع، استخدم أقرب صفحة
+        # استرجعها النظام فعلًا بدل ترك الإجابة بلا صفحة أو اختلاق رقم من النموذج.
+        # لا ينطبق هذا على أسئلة النصوص المرفقة في الامتحان (passage_key)، إذ تُجاب من النص نفسه.
+        if not refs and not d.get("passage") and pages_of.get(key) and conf in ("high", "medium"):
+            candidates = []
+            for ex in items[key - 1].get("book_excerpts", []):
+                pair = (str(ex.get("book_key", "main")), int(ex.get("page", 0) or 0))
+                if pair in pages_of[key] and pair[1] > 0:
+                    candidates.append(pair)
+            if candidates:
+                # الأفضلية للكتاب الرئيسي، ثم أول صفحة مسترجعة حسب الصلة داخل ذلك المصدر.
+                main_key = str((ctx or {}).get("main_key", "main"))
+                chosen = next((p for p in candidates if p[0] == main_key), candidates[0])
+                refs.append({"book_key": chosen[0], "page": chosen[1]})
+                res["ai_conf"] = "medium"
+                note = res.get("ai_note") or ""
+                suffix = "الصفحة مقترحة من أقرب مقطع مسترجع؛ يُرجى التحقق منها." if _lang_name(d["question"], d.get("passage")) == "Arabic" else "Page suggested from the closest retrieved excerpt; please verify it."
+                res["ai_note"] = (note + " " + suffix).strip()[:300]
         if refs:
             res["source_refs"] = refs
             main_key = str((ctx or {}).get("main_key", "main"))
@@ -992,7 +1025,7 @@ def _review_section(book, flat_lessons, user, lang, idx=None, comp_idx=None, com
         st.session_state[pkey] = page + 1
         st.rerun()
     page_items = drafts[(page - 1) * size: page * size]
-    st.caption("مهم: استخراج الأسئلة لا يجيب عنها تلقائيًا. استخدم زر «اقتراح إجابات للأسئلة المعروضة» لإعداد الإجابات ومراجع الصفحات من الكتاب الرئيسي والكتاب المرافق إن توفر.")
+    st.caption("مهم: استخراج الأسئلة لا يجيب عنها تلقائيًا. استخدم زر «اقتراح إجابات للأسئلة المعروضة» لإعداد إجابات مقترحة لأنواع الأسئلة المدعومة، مع مراجع الصفحات من الكتاب الرئيسي والكتاب المرافق إن توفر. الأسئلة المقالية والمطابقة تُعرض لها إجابة نموذجية نصية.")
     main_key = book.get("slug", "main")
     sources = [{"key": main_key, "title": book.get("title") or book.get("name") or main_key,
                 "idx": idx, "offset": book.get("page_offset", 0)}] if idx is not None else []
@@ -1096,6 +1129,10 @@ def _review_section(book, flat_lessons, user, lang, idx=None, comp_idx=None, com
                     d["model_answer"] = st.text_area("الإجابة النموذجية", d.get("model_answer") or "",
                                                      key=f"{k}_a").strip() or None
             with st.expander("📍 الصفحات والدروس التي أُخذت منها الإجابة"):
+                if d.get("passage"):
+                    st.caption("هذا السؤال يعتمد على نص مرفق بالامتحان؛ لا تُنسب إجابته تلقائيًا إلى صفحة من الكتاب.")
+                elif not ai_ctx.get("sources") or not any(x.get("idx") for x in (ai_ctx.get("sources") or [])):
+                    st.warning("لم يُحمّل فهرس صفحات الكتاب الرئيسي أو المرافق. لا يمكن تحديد رقم صفحة موثوق حتى يُفهرس الكتاب.")
                 if d.get("source_refs"):
                     for ref in d["source_refs"]:
                         src = next((x for x in ((ai_ctx.get("sources") or [])) if x.get("key") == ref.get("book_key")), None)
