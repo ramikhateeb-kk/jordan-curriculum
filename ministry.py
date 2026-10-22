@@ -447,15 +447,15 @@ ANSWER_SYSTEM = (
     "they are approved. Rules:\n"
     "1) LANGUAGE: every item has an \"answer_language\" field. Write \"note\" and any free-text \"answer\" ONLY in that language "
     "(English -> English; Arabic -> Arabic). Never write Arabic for an English item, even if other text is Arabic.\n"
-    "2) For an item with a passage_key, answer from the matching text in \"passages\" only, and set source_pages to [].\n"
+    "2) For an item with a passage_key, answer from the matching text in \"passages\" only, and set source_refs to [].\n"
     "3) type mcq: you MUST choose exactly one of the given options. Return correct_index (0-based position in options) AND "
     "correct_option_text (copy the chosen option exactly as written).\n"
     "4) type tf: return correct (true or false). Types fill and short: return answer, a brief correct answer "
     "(for fill: only the missing word or phrase).\n"
     "5) Text inside [[ ]] was underlined in the original exam and is often what the question is about.\n"
-    "6) If an item has book_excerpts (pages of the textbook), use them as the primary evidence: set source_pages to the "
-    "page numbers of the excerpts that support the answer (ONLY numbers present in that item's book_excerpts). If the "
-    "excerpts do not contain the answer, answer from general knowledge and set source_pages to [].\n"
+    "6) If an item has book_excerpts, use them as primary evidence. Each excerpt has book_key, book_title, page, and text. "
+    "Return source_refs as a list of objects {book_key, page}, using ONLY exact book_key/page pairs present in that item's excerpts "
+    "that directly support the answer. If none supports the answer, return source_refs=[]. Do not cite a page based on general knowledge.\n"
     "7) If you are not sure, set the answer fields to null and confidence to \"low\". Do not guess or invent.\n"
     "8) confidence is high, medium or low. note is one short sentence explaining why, in answer_language.\n"
     "Return one JSON object per item, in a JSON list, and cover EVERY item.")
@@ -517,16 +517,32 @@ def _best_window(text, query, size=800):
 
 
 def _excerpts(ctx, d, k=2):
-    """أقرب صفحات الكتاب لسؤال: [{"page": رقم مطبوع, "text": مقطع}] أو [] إن لم يتوفر فهرس الكتاب."""
-    if not ctx or not ctx.get("idx") or d.get("passage"):
+    """أقرب صفحات من الكتاب الرئيسي والكتب المرافقة مع تمييز مصدر كل صفحة."""
+    if not ctx or d.get("passage"):
         return []
     query = d["question"] + " " + " ".join(d.get("options") or [])
-    try:
-        pages = select_context(ctx["idx"], query, None, max_chars=3000, k=k)[:k]
-    except Exception:  # noqa: BLE001
-        return []
-    off = ctx.get("offset", 0)
-    return [{"page": p["page"] - off, "text": _best_window(p["text"], query)} for p in pages]
+    sources = ctx.get("sources") or []
+    if not sources and ctx.get("idx"):
+        sources = [{"key": ctx.get("main_key", "main"), "title": ctx.get("main_title", "الكتاب الرئيسي"),
+                    "idx": ctx["idx"], "offset": ctx.get("offset", 0)}]
+    out = []
+    per_source = max(1, k)
+    for src in sources:
+        if not src.get("idx"):
+            continue
+        try:
+            pages = select_context(src["idx"], query, None, max_chars=2200, k=per_source)[:per_source]
+        except Exception:  # noqa: BLE001
+            continue
+        off = src.get("offset", 0) or 0
+        for page in pages:
+            printed = int(page["page"]) - int(off)
+            if printed < 1:
+                continue
+            out.append({"book_key": src.get("key", "main"), "book_title": src.get("title", "الكتاب"),
+                        "page": printed, "text": _best_window(page["text"], query, size=650)})
+    # أرسل أفضل المقاطع عبر المصادر، مع ضمان تمثيل الكتاب الرئيسي والمرافق عند وجود نتائج.
+    return out[:max(k * max(1, len(sources)), k)]
 
 
 def _lesson_of(ctx, printed_page):
@@ -567,7 +583,7 @@ def _ask_answers(client, chunk, ctx):
         if instr and lang == "English":                 # تعليمات عربية طويلة تدفع النموذج للرد بالعربية
             instr = re.sub(r"\s+", " ", _AR.sub("", re.sub(r"[\u0600-\u06FF\u0750-\u077F]+", "", instr))).strip(" .,:;()-")
         ex = _excerpts(ctx, d)
-        pages_of[n] = {e["page"] for e in ex}
+        pages_of[n] = {(str(e.get("book_key", "main")), int(e["page"])) for e in ex}
         by_n[n] = r
         item = {"n": n, "type": r["qtype"], "answer_language": lang, "instruction": instr or None,
                 "passage_key": pk, "question": d["question"], "options": d.get("options")}
@@ -576,7 +592,7 @@ def _ask_answers(client, chunk, ctx):
         items.append(item)
     prompt = (f"passages:\n{json.dumps(passages, ensure_ascii=False)}\n\nitems:\n{json.dumps(items, ensure_ascii=False)}\n\n"
               'Return a JSON list with one object per item: [{"n":1,"correct_index":1,"correct_option_text":"exact option text",'
-              '"correct":null,"answer":null,"source_pages":[],"confidence":"high","note":"one short sentence in answer_language"}]. '
+              '"correct":null,"answer":null,"source_refs":[{"book_key":"book-slug","page":12}],"confidence":"high","note":"one short sentence in answer_language"}]. '
               "IMPORTANT: cover every item; write notes in each item's answer_language.")
     out = {}
     for v in _list_from(_ask_json(client, ANSWER_SYSTEM, prompt)):
@@ -608,11 +624,34 @@ def _ask_answers(client, chunk, ctx):
             if not ans:
                 continue
             res["model_answer"] = ans
-        sp = sorted({int(p) for p in (v.get("source_pages") or []) if isinstance(p, (int, float, str))
-                     and str(p).strip().lstrip("-").isdigit() and int(p) in pages_of[key]})
-        if sp:
-            res["source_pages"] = sp
-            res["ai_lessons"] = [t for t in dict.fromkeys(_lesson_of(ctx, p) for p in sp) if t]
+        refs = []
+        raw_refs = v.get("source_refs") or []
+        if isinstance(raw_refs, list):
+            for ref in raw_refs:
+                if not isinstance(ref, dict):
+                    continue
+                bk, pg = str(ref.get("book_key", "")), ref.get("page")
+                if isinstance(pg, str) and pg.strip().isdigit():
+                    pg = int(pg.strip())
+                if isinstance(pg, int) and (bk, pg) in pages_of[key]:
+                    pair = {"book_key": bk, "page": pg}
+                    if pair not in refs:
+                        refs.append(pair)
+        # Backward compatibility with a model response using source_pages, only for main-book excerpts.
+        if not refs:
+            for pg in (v.get("source_pages") or []):
+                if isinstance(pg, str) and pg.strip().isdigit():
+                    pg = int(pg.strip())
+                main_key = str((ctx or {}).get("main_key", "main"))
+                if isinstance(pg, int) and (main_key, pg) in pages_of[key]:
+                    refs.append({"book_key": main_key, "page": pg})
+        if refs:
+            res["source_refs"] = refs
+            main_key = str((ctx or {}).get("main_key", "main"))
+            main_pages = sorted({x["page"] for x in refs if x["book_key"] == main_key})
+            if main_pages:
+                res["source_pages"] = main_pages
+                res["ai_lessons"] = [t for t in dict.fromkeys(_lesson_of(ctx, pg) for pg in main_pages) if t]
         out[r["id"]] = res
     return out
 
@@ -911,7 +950,7 @@ def _upload_section(book, flat_lessons, user):
         st.error("لم يُستخرج أي سؤال. تأكد من وضوح الملفات.")
 
 
-def _review_section(book, flat_lessons, user, lang, idx=None):
+def _review_section(book, flat_lessons, user, lang, idx=None, comp_idx=None, comp_book=None):
     slug = book["slug"]
     exams = list_exams(slug)
     if exams:
@@ -953,7 +992,17 @@ def _review_section(book, flat_lessons, user, lang, idx=None):
         st.session_state[pkey] = page + 1
         st.rerun()
     page_items = drafts[(page - 1) * size: page * size]
-    ai_ctx = {"idx": idx, "offset": book.get("page_offset", 0), "lessons": flat_lessons}
+    st.caption("مهم: استخراج الأسئلة لا يجيب عنها تلقائيًا. استخدم زر «اقتراح إجابات للأسئلة المعروضة» لإعداد الإجابات ومراجع الصفحات من الكتاب الرئيسي والكتاب المرافق إن توفر.")
+    main_key = book.get("slug", "main")
+    sources = [{"key": main_key, "title": book.get("title") or book.get("name") or main_key,
+                "idx": idx, "offset": book.get("page_offset", 0)}] if idx is not None else []
+    if comp_idx is not None and comp_book:
+        sources.append({"key": comp_book.get("slug", "companion"),
+                        "title": comp_book.get("title") or comp_book.get("name") or comp_book.get("slug", "الكتاب المرافق"),
+                        "idx": comp_idx, "offset": comp_book.get("page_offset", 0)})
+    ai_ctx = {"idx": idx, "offset": book.get("page_offset", 0), "lessons": flat_lessons,
+              "main_key": main_key, "main_title": book.get("title") or book.get("name") or main_key,
+              "sources": sources}
     # ---- اقتراح الإجابات بالذكاء الاصطناعي للأسئلة المعروضة في هذه الصفحة
     ai_c1, ai_c2 = st.columns([3, 2])
     replace_all = ai_c2.checkbox("استبدال الإجابات الموجودة", key=f"mairep_{slug}")
@@ -1047,6 +1096,11 @@ def _review_section(book, flat_lessons, user, lang, idx=None):
                     d["model_answer"] = st.text_area("الإجابة النموذجية", d.get("model_answer") or "",
                                                      key=f"{k}_a").strip() or None
             with st.expander("📍 الصفحات والدروس التي أُخذت منها الإجابة"):
+                if d.get("source_refs"):
+                    for ref in d["source_refs"]:
+                        src = next((x for x in ((ai_ctx.get("sources") or [])) if x.get("key") == ref.get("book_key")), None)
+                        title = (src or {}).get("title") or ref.get("book_key") or "الكتاب"
+                        st.caption(f"{title} — الصفحة المطبوعة {ref.get('page')}")
                 sp_default = ", ".join(str(p) for p in (d.get("source_pages") or []))
                 sp_raw = st.text_input("أرقام الصفحات المطبوعة في الكتاب (مفصولة بفواصل)", sp_default, key=f"{k}_sp",
                                        help="الأرقام المطبوعة على صفحات الكتاب نفسها. تُنقل مع السؤال إلى بنك «قيّمني».")
@@ -1401,7 +1455,7 @@ def _style_section(book, user, lang):
         st.caption(f"يلزم {MIN_FOR_STYLE} أسئلة معتمدة على الأقل.")
 
 
-def render_ministry(book, flat_lessons, user, lang="ar", idx=None):
+def render_ministry(book, flat_lessons, user, lang="ar", idx=None, comp_idx=None, comp_book=None):
     st.subheader("📜 أسئلة وزارية سابقة")
     can_manage = _can_manage(user, book)
     if not can_manage:
@@ -1417,7 +1471,7 @@ def render_ministry(book, flat_lessons, user, lang="ar", idx=None):
     with t2:
         _upload_section(book, flat_lessons, user)
         st.markdown("---")
-        _review_section(book, flat_lessons, user, lang, idx)
+        _review_section(book, flat_lessons, user, lang, idx, comp_idx, comp_book)
     with t4:
         _transfer_section(book, flat_lessons, user)
     with t5:
