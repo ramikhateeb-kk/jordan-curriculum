@@ -284,16 +284,53 @@ def read_sources(f):
 
 
 # ================================================================ الاستخراج بالذكاء الاصطناعي
+_LAST_AI_ERROR = ""
+
+
+def _parse_json_response(raw):
+    """يقرأ JSON حتى لو أعاده النموذج داخل code fence أو أضاف نصًا قصيرًا حوله."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("أعاد النموذج استجابة فارغة.")
+    cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", raw.strip(), flags=re.I)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # استعادة الكائن/القائمة من أي نص تمهيدي أو لاحق غير مقصود.
+        starts = [i for i in (cleaned.find("{"), cleaned.find("[")) if i >= 0]
+        if not starts:
+            raise
+        start = min(starts)
+        for end in range(len(cleaned), start, -1):
+            candidate = cleaned[start:end].strip()
+            if candidate and candidate[-1] in "}]":
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+        raise
+
+
 def _ask_json(client, system, contents, temperature=0):
-    for _ in range(2):
+    """يطلب JSON، ثم يعيد المحاولة دون وضع JSON الصارم إذا لم يدعمه النموذج."""
+    global _LAST_AI_ERROR
+    _LAST_AI_ERROR = ""
+    attempts = [
+        types.GenerateContentConfig(system_instruction=system, temperature=temperature,
+                                    response_mime_type="application/json"),
+        types.GenerateContentConfig(system_instruction=system + "\nأعد JSON صالحًا فقط دون Markdown أو أسوار برمجية.",
+                                    temperature=temperature),
+    ]
+    errors = []
+    for cfg in attempts:
         try:
-            r = client.models.generate_content(
-                model=GEMINI_MODEL, contents=contents,
-                config=types.GenerateContentConfig(system_instruction=system, temperature=temperature,
-                                                    response_mime_type="application/json"))
-            return json.loads(re.sub(r"^```(?:json)?|```$", "", r.text.strip()).strip())
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=cfg)
+            return _parse_json_response(getattr(response, "text", None))
         except Exception as e:  # noqa: BLE001
-            print("ministry: خطأ JSON:", e)
+            # لا نعرض أسرار البيئة أو مفاتيح API في واجهة المستخدم.
+            msg = re.sub(r"(?i)(api[_ -]?key\s*[:=]\s*)[^\s,}]+", r"\1[مخفي]", str(e))
+            errors.append(msg[:500])
+            print("ministry: تعذر تحليل استجابة Gemini:", msg)
+    _LAST_AI_ERROR = " | ".join(errors) or "لم يُرجع النموذج بيانات قابلة للقراءة."
     return None
 
 
@@ -979,8 +1016,12 @@ def _upload_section(book, flat_lessons, user):
         st.warning(m)
     if items:
         st.success(f"استُخرج {len(items)} سؤالًا كمسوّدات. راجعها أدناه ثم اعتمدها.")
-    elif not failed:
-        st.error("لم يُستخرج أي سؤال. تأكد من وضوح الملفات.")
+    else:
+        st.error("لم يُستخرج أي سؤال من الملفات المحددة.")
+        if _LAST_AI_ERROR:
+            st.warning("تفاصيل تعثر الذكاء الاصطناعي (بعد إخفاء أي مفتاح ظاهر):")
+            st.code(_LAST_AI_ERROR, language=None)
+        st.info("تحقق من أن مفتاح Gemini صالح، وأن اسم النموذج في Secrets/Environment متاح، ثم جرّب PDF نصيًا أو صورة واضحة لصفحة واحدة.")
 
 
 def _review_section(book, flat_lessons, user, lang, idx=None, comp_idx=None, comp_book=None):
