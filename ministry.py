@@ -980,7 +980,7 @@ def _batches(units, max_pages=6):
     return out
 
 
-def _upload_section(book, flat_lessons, user):
+def _upload_section(book, flat_lessons, user, idx=None, comp_idx=None, comp_book=None):
     slug = book["slug"]
     st.caption("ارفع ملفات امتحانات سابقة (TXT / Word / PDF / صور). تُحوَّل إلى مسوّدات تراجعها قبل الاعتماد. "
                "كل دفعة (حتى 6 صفحات متتابعة، أو جزء نصي) تُحتسب طلبًا واحدًا من الحصة اليومية. تُقتطع الأشكال من الصور تلقائيًا.")
@@ -1012,10 +1012,40 @@ def _upload_section(book, flat_lessons, user):
             tag_lessons(client, items, flat_lessons, user)
             exam_id = add_exam(slug, int(year), session.strip(), ", ".join(f.name for f in files)[:200], user["id"])
             add_questions(exam_id, slug, items)
+            # بعد الاستخراج مباشرةً، اقترح الإجابات مع تمرير فهارس الكتاب الرئيسي والمرافق.
+            # إذا تعذرت الإجابة فلا نفقد الأسئلة المستخرجة؛ تبقى مسوّدات قابلة للمراجعة اليدوية.
+            main_key = book.get("slug", "main")
+            sources = [{"key": main_key, "title": book.get("title") or book.get("name") or main_key,
+                        "idx": idx, "offset": book.get("page_offset", 0)}] if idx is not None else []
+            if comp_idx is not None and comp_book:
+                sources.append({"key": comp_book.get("slug", "companion"),
+                                "title": comp_book.get("title") or comp_book.get("name") or comp_book.get("slug", "الكتاب المرافق"),
+                                "idx": comp_idx, "offset": comp_book.get("page_offset", 0)})
+            ai_ctx = {"idx": idx, "offset": book.get("page_offset", 0), "lessons": flat_lessons,
+                      "main_key": main_key, "main_title": book.get("title") or book.get("name") or main_key,
+                      "sources": sources}
+            try:
+                saved_rows = list_questions(slug, status="draft", exam_id=exam_id)
+                answerable = [q for q in saved_rows if q.get("qtype") in ANSWER_TYPES]
+                if answerable:
+                    with st.spinner(f"تم استخراج {len(items)} سؤالًا. جارٍ اقتراح الإجابات والتحقق من صفحات المصادر..."):
+                        done_n, tried_n, failed_rows = _apply_ai(user, answerable, replace_existing=True, ctx=ai_ctx)
+                    st.session_state[f"ministry_auto_answer_{slug}"] = (done_n, tried_n, len(failed_rows))
+            except Exception as e:  # noqa: BLE001
+                # فشل الإجابة لا يجب أن يلغي حفظ الأسئلة.
+                print("ministry: تعذّر اقتراح الإجابات بعد الاستخراج:", str(e)[:500])
+                st.session_state[f"ministry_auto_answer_error_{slug}"] = "تعذّر إكمال الإجابات تلقائيًا. بقيت الأسئلة محفوظة ويمكن إعادة المحاولة من قسم المراجعة."
     for m in failed:
         st.warning(m)
     if items:
-        st.success(f"استُخرج {len(items)} سؤالًا كمسوّدات. راجعها أدناه ثم اعتمدها.")
+        st.success(f"استُخرج {len(items)} سؤالًا كمسوّدات. راجع الإجابات المقترحة ومصادرها قبل الاعتماد.")
+        auto = st.session_state.pop(f"ministry_auto_answer_{slug}", None)
+        if auto:
+            done_n, tried_n, failed_n = auto
+            st.info(f"اقتُرحت إجابات لـ {done_n} من {tried_n} سؤالًا. {failed_n} سؤالًا يحتاج إلى إعادة المحاولة أو مراجعة يدوية. راجع اسم الكتاب ورقم الصفحة لكل إجابة.")
+        auto_err = st.session_state.pop(f"ministry_auto_answer_error_{slug}", None)
+        if auto_err:
+            st.warning(auto_err)
     else:
         st.error("لم يُستخرج أي سؤال من الملفات المحددة.")
         if _LAST_AI_ERROR:
@@ -1178,7 +1208,9 @@ def _review_section(book, flat_lessons, user, lang, idx=None, comp_idx=None, com
                     for ref in d["source_refs"]:
                         src = next((x for x in ((ai_ctx.get("sources") or [])) if x.get("key") == ref.get("book_key")), None)
                         title = (src or {}).get("title") or ref.get("book_key") or "الكتاب"
-                        st.caption(f"{title} — الصفحة المطبوعة {ref.get('page')}")
+                        st.caption(f"📚 مصدر الإجابة: {title} — الصفحة المطبوعة {ref.get('page')}")
+                elif d.get("ai_answer") and not d.get("passage"):
+                    st.warning("لم تُثبت الإجابة بصفحة محددة من الكتب المفهرسة. لا تعتمد رقم صفحة تلقائيًا؛ راجع الإجابة أو أعد اقتراحها بعد التأكد من فهرسة الكتاب.")
                 sp_default = ", ".join(str(p) for p in (d.get("source_pages") or []))
                 sp_raw = st.text_input("أرقام الصفحات المطبوعة في الكتاب (مفصولة بفواصل)", sp_default, key=f"{k}_sp",
                                        help="الأرقام المطبوعة على صفحات الكتاب نفسها. تُنقل مع السؤال إلى بنك «قيّمني».")
@@ -1547,7 +1579,7 @@ def render_ministry(book, flat_lessons, user, lang="ar", idx=None, comp_idx=None
     with t1:
         _bank_tab(book, user, True, lang)
     with t2:
-        _upload_section(book, flat_lessons, user)
+        _upload_section(book, flat_lessons, user, idx, comp_idx, comp_book)
         st.markdown("---")
         _review_section(book, flat_lessons, user, lang, idx, comp_idx, comp_book)
     with t4:
