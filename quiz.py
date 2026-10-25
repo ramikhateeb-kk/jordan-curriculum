@@ -18,6 +18,7 @@ import companion
 import images
 import rag
 import ministry
+import ministry_analysis
 import qbank
 import reading_texts
 import subject_profiles as sp
@@ -34,10 +35,11 @@ QTYPES = {
 
 SYSTEM = (
     "أنت معلم للمنهاج الأردني يضع أسئلة تقويمية دقيقة. التزم بالآتي بصرامة:\n"
-    "1) استخدم فقط نص الكتاب المرفق، ولا تستخدم أي معلومة من خارجه، ولا تخترع تفاصيل ليست فيه.\n"
-    "2) يجب أن تكون إجابة السؤال موجودة صراحة في النص المرفق، لا مُستنتجة أو مُخمَّنة.\n"
-    "3) اكتب بالعربية الفصحى الواضحة، وضع رقم الصفحة التي أخذت منها السؤال بدقة.\n"
-    "4) في الاختيار من متعدد اجعل الخيارات الثلاثة الخاطئة معقولة، لكن غير موجودة في النص كإجابة صحيحة.\n"
+    "1) استخدم مفاهيم وقواعد وأمثلة الكتاب المرفق فقط، ولا تدخل معلومات خارج المنهاج. يجوز إنشاء سؤال جديد يطبق المعرفة الواردة في الدرس في سياق جديد.\n"
+    "2) يجب أن تكون الإجابة قابلة للاشتقاق الصحيح من محتوى الدرس؛ لا تخمّن ولا تختلق معطيات غير مذكورة.\n"
+    "3) اكتب بالعربية الفصحى الواضحة، وضع رقم الصفحة فقط إذا أمكن ربط السؤال بصفحة فعلية من النص.\n"
+    "4) في الاختيار من متعدد اجعل الخيارات الخاطئة معقولة لكنها غير صحيحة، وتأكد من وجود إجابة واحدة صحيحة فقط.\n"
+    "5) في المسائل الرياضية والعلمية، اشرح القانون وخطوات الحل والوحدات في التفسير عند الحاجة.\n"
     "أعد JSON فقط بلا أي نص آخر."
 )
 def _md_u(text):
@@ -52,11 +54,12 @@ def _md_u(text):
 
 SYSTEM_EN = (
     "You are a teacher of the Jordanian curriculum writing accurate assessment questions in English. Follow strictly:\n"
-    "1) Use ONLY the attached book text; do not use outside information or invent details.\n"
-    "2) The answer must be explicitly supported by the attached text, not inferred or guessed.\n"
-    "3) Write clear English and give the exact page number you took the question from.\n"
-    "4) For multiple choice, make the three wrong options plausible but not correct according to the text.\n"
-    "5) Practice material from the workbook, if provided, is only a guide to question types and language points; "
+    "1) Use only concepts, rules and examples supported by the attached lesson; do not introduce knowledge outside the curriculum. New questions may apply taught concepts in a new context.\n"
+    "2) The answer must be derivable correctly from the lesson content. Never guess or invent unsupported data.\n"
+    "3) Write clear English and provide a page number only when it matches an actual supplied page.\n"
+    "4) For multiple choice, make wrong options plausible but incorrect, with exactly one defensible correct answer.\n"
+    "5) For maths and science problems, include the relevant law, solution steps and units in the explanation when applicable.\n"
+    "6) Practice material from the workbook, if provided, is only a guide to question types and language points; "
     "the page number must be a page of the book text, never of the workbook.\n"
     "Return JSON only, no other text."
 )
@@ -236,7 +239,10 @@ def _generate(client, idx, slug, lesson, qtype, asked_texts, passage=None):
     ctx_pages = select_context(idx, lesson["title"], (lesson["start"], lesson["end"]), max_chars=CONTEXT_BUDGET)
     if not ctx_pages:
         return None, None
-    style = ministry.style_snippet(slug, qtype, lang)              # نمط الأسئلة الوزارية (إن وُجد)
+    style = ministry.style_snippet(slug, qtype, lang)              # نمط الصياغة الوزارية والأمثلة المعتمدة
+    objective_guidance = ministry_analysis.generation_guidance(slug, lang=lang)
+    if objective_guidance:
+        style = (style + "\\n\n" if style else "") + objective_guidance
     kind = sp.lesson_kind(lesson["title"]) if lang == "en" else None
     stored = reading_texts.texts_of(slug, lesson["title"])         # نصوص قراءة محفوظة لهذا الدرس (آليًا أو يدويًا، أي لغة)
     if kind in sp.PASSAGE_KINDS or stored:

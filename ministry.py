@@ -1574,8 +1574,8 @@ def render_ministry(book, flat_lessons, user, lang="ar", idx=None, comp_idx=None
             return
         _bank_tab(book, user, False, lang)
         return
-    t1, t2, t4, t5, t6, t3 = st.tabs(["📚 البنك", "⬆️ رفع ومراجعة", "🏦 نقل إلى بنك قيّمني", "📄 نصوص القراءة",
-                                      "📘 شرح القواعد", "🎯 نمط الأسئلة"])
+    t1, t2, t4, t5, t6, t3, t7 = st.tabs(["📚 البنك", "⬆️ رفع ومراجعة", "🏦 نقل إلى بنك قيّمني", "📄 نصوص القراءة",
+                                           "📘 شرح القواعد", "🎯 نمط الأسئلة", "🧠 تحليل الأهداف"])
     with t1:
         _bank_tab(book, user, True, lang)
     with t2:
@@ -1590,3 +1590,6 @@ def render_ministry(book, flat_lessons, user, lang="ar", idx=None, comp_idx=None
         _grammar_section(book, flat_lessons, user, lang, idx)
     with t3:
         _style_section(book, user, lang)
+    with t7:
+        import ministry_analysis
+        ministry_analysis.render_analysis_section(book, lang)
