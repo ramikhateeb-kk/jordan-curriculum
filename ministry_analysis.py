@@ -246,7 +246,9 @@ def _match_import_item(item, rows):
             # Avoid ambiguous fuzzy matches.
             if len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.04:
                 return scored[0][1], scored[0][0], "نص السؤال"
-    if number is not None:
+    # لا نطابق برقم السؤال وحده إذا كان نص السؤال موجودًا؛ فقد تكون أرقام الملف
+    # مختلفة عن أرقام قاعدة البيانات، وهذا كان يربط إجابات بأسئلة غير صحيحة.
+    if number is not None and not qtext:
         candidates = []
         for row in rows:
             data = row.get("data") or {}
@@ -254,11 +256,7 @@ def _match_import_item(item, rows):
             if any(str(v).strip() == str(number).strip() for v in vals if v is not None):
                 candidates.append(row)
         if len(candidates) == 1:
-            return candidates[0], 0.65, "رقم السؤال (تطابق وحيد)"
-        if qtext and candidates:
-            ranked = sorted(((difflib.SequenceMatcher(None, qtext, _norm_question((r.get("data") or {}).get("question"))).ratio(), r) for r in candidates), key=lambda x: x[0], reverse=True)
-            if ranked and ranked[0][0] >= 0.55 and (len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= 0.04):
-                return ranked[0][1], ranked[0][0], "رقم السؤال ونصه"
+            return candidates[0], 0.65, "رقم السؤال (لا يوجد نص للمطابقة)"
     return None, 0.0, "لم يُعثر على تطابق آمن"
 
 
@@ -367,6 +365,76 @@ def import_analysis_json(book, payload, rows=None, preview=None):
             "failed": failed, "total": len(matches), "errors": errors[:5]}
 
 
+
+def import_analysis_as_exam(book, payload):
+    """Import every JSON question as a new draft exam without Gemini or prior question matching."""
+    import ministry
+    meta = payload.get("metadata") if isinstance(payload, dict) and isinstance(payload.get("metadata"), dict) else {}
+    items = _import_items(payload)
+    if not items:
+        raise ValueError("ملف التحليل لا يحتوي على أسئلة.")
+    user = st.session_state.get("user") or st.session_state.get("current_user") or {}
+    user_id = user.get("id") if isinstance(user, dict) else None
+    try:
+        year = int(meta.get("exam_year")) if meta.get("exam_year") is not None else None
+    except (TypeError, ValueError):
+        year = None
+    session = str(meta.get("exam_session") or "استيراد تحليل JSON")
+    subject = str(meta.get("subject") or book.get("subject") or "")
+    grade = str(meta.get("grade") or book.get("grade") or "")
+    title = f"{subject} - {grade} - {year or ''} - {session}".strip(" -")[:200]
+    exam_id = ministry.add_exam(book["slug"], year, session[:160], title, user_id)
+    type_map = {"mcq": "mcq", "tf": "tf", "fill": "fill", "short_answer": "short",
+                "short": "short", "open_ended": "other", "essay": "essay", "matching": "matching", "other": "other"}
+    records = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        qtext = str(item.get("question") or item.get("question_text") or "").strip()
+        if not qtext:
+            continue
+        ans = item.get("answer") if isinstance(item.get("answer"), dict) else {}
+        source = item.get("source") if isinstance(item.get("source"), dict) else {}
+        analysis = item.get("analysis") if isinstance(item.get("analysis"), dict) else item.get("learning_analysis")
+        original_type = str(item.get("question_type") or item.get("type") or "other").lower()
+        qtype = type_map.get(original_type, "other")
+        options = item.get("options") if isinstance(item.get("options"), list) else []
+        options = [str(x).strip() for x in options if str(x).strip()]
+        if qtype == "mcq" and len(options) < 2:
+            qtype = "other"
+        data = {"type": qtype, "question": qtext, "options": options,
+                "section": item.get("section") or item.get("part"),
+                "instruction": item.get("instruction"),
+                "correct_index": None, "correct": None,
+                "model_answer": ans.get("model_answer") or item.get("model_answer"),
+                "explanation": ans.get("explanation") or item.get("explanation"),
+                "answer_source": source.get("kind") or "not_verified",
+                "answer_source_book": source.get("book"),
+                "source_pages": source.get("pages") if isinstance(source.get("pages"), list) else [],
+                "source_note": source.get("note"),
+                "source_kind": source.get("kind") or "not_verified"}
+        ci = ans.get("correct_index", item.get("correct_index"))
+        if qtype == "mcq" and isinstance(ci, int) and not isinstance(ci, bool) and 0 <= ci < len(options):
+            data["correct_index"] = ci
+        if ans.get("correct") is not None:
+            data["correct"] = ans.get("correct")
+        if ans.get("correct_option_text"):
+            data["correct_option_text"] = str(ans["correct_option_text"])
+        if isinstance(analysis, dict):
+            data[ANALYSIS_KEY] = dict(analysis)
+            data[ANALYSIS_KEY]["imported_at"] = datetime.now(timezone.utc).isoformat()
+        number = item.get("number", item.get("n", item.get("seq")))
+        try:
+            number = int(number) if number is not None else None
+        except (TypeError, ValueError):
+            number = None
+        records.append({"number": number, "qtype": qtype, "data": data, "lesson_title": None})
+    if not records:
+        raise ValueError("لم أتمكن من تحويل أي سؤال من ملف JSON.")
+    ministry.add_questions(exam_id, book["slug"], records)  # تبقى مسودات للمراجعة، ولا تُنشر تلقائيًا
+    return {"exam_id": exam_id, "imported": len(records), "total": len(items), "skipped": len(items)-len(records), "title": title}
+
+
 def render_analysis_section(book, lang="ar"):
     """واجهة تحليل عامة لجميع المباحث، تعتمد على الأسئلة الوزارية المعتمدة للكتاب الحالي."""
     import ministry
@@ -401,7 +469,18 @@ def render_analysis_section(book, lang="ar"):
                     "طريقة المطابقة": e["method"],
                 })
             st.dataframe(preview_rows, use_container_width=True, hide_index=True)
-            if st.button("✅ استيراد النتائج المطابقة إلى الأسئلة المعتمدة", key=f"apply_analysis_json_{slug}", disabled=not good):
+            st.info("إذا لم تكن قد رفعت الامتحان الأصلي بسبب نفاد حصة Gemini، استخدم الاستيراد المباشر أدناه. سيُنشئ امتحانًا جديدًا من جميع أسئلة JSON دون مطابقة أو استدعاء Gemini.")
+            direct_col, match_col = st.columns(2)
+            if direct_col.button("📥 استيراد كل أسئلة JSON كامتحان جديد", key=f"direct_import_analysis_json_{slug}"):
+                try:
+                    with st.spinner("جارٍ استيراد الأسئلة والإجابات والتحليل محليًا..."):
+                        result = import_analysis_as_exam(book, import_payload)
+                    st.success(f"تم استيراد {result['imported']} من {result['total']} سؤالًا إلى امتحان جديد كمسودات للمراجعة. لم يتم استخدام Gemini.")
+                    st.caption("افتح قائمة الامتحانات الوزارية، ثم راجع المسودات واعتمد الأسئلة بعد التأكد من الإجابات والمصادر.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"تعذر الاستيراد المباشر: {exc}")
+            if match_col.button("🔗 استيراد النتائج المطابقة فقط", key=f"apply_analysis_json_{slug}", disabled=not good):
                 with st.spinner("جارٍ حفظ الإجابات والتحليلات المستوردة..."):
                     result = import_analysis_json(book, import_payload, rows=approved, preview=import_matches)
                 st.success(f"تم تحديث {result['updated']} سؤالًا. عناصر لم تُحدّث/فشلت: {result['failed']} من أصل {result['total']}.")
