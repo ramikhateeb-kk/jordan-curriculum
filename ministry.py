@@ -1199,7 +1199,24 @@ def _review_section(book, flat_lessons, user, lang, idx=None, comp_idx=None, com
                 with st.expander("✏️ تعديل الإجابة النموذجية (اختياري)"):
                     d["model_answer"] = st.text_area("الإجابة النموذجية", d.get("model_answer") or "",
                                                      key=f"{k}_a").strip() or None
-            with st.expander("📍 الصفحات والدروس التي أُخذت منها الإجابة"):
+            with st.expander("📍 مصدر السؤال والإجابة: الكتاب والصفحة والدرس"):
+                # بيانات المصدر المستوردة من JSON يجب أن تبقى ظاهرة حتى لو لم يكن
+                # السؤال مرتبطًا بعد بدرس داخلي في قاعدة بيانات المنهاج.
+                source_kind_labels = {
+                    "student_book": "الكتاب الرئيسي",
+                    "companion_book": "الكتاب المرافق",
+                    "exam_only": "من نص/ورقة الامتحان",
+                    "not_verified": "غير موثّق",
+                }
+                imported_source_kind = d.get("source_kind") or d.get("answer_source") or "not_verified"
+                imported_source_book = d.get("answer_source_book") or d.get("source_book")
+                imported_source_note = d.get("source_note") or d.get("source_lesson") or ""
+                if imported_source_book:
+                    st.markdown(f"**📚 اسم الكتاب:** {html.escape(str(imported_source_book))}")
+                if imported_source_kind:
+                    st.caption("نوع المصدر: " + source_kind_labels.get(imported_source_kind, str(imported_source_kind)))
+                if imported_source_note:
+                    st.markdown("**📖 الدرس/تفصيل المصدر حسب ملف JSON:** " + html.escape(str(imported_source_note)))
                 if d.get("passage"):
                     st.caption("هذا السؤال يعتمد على نص مرفق بالامتحان؛ لا تُنسب إجابته تلقائيًا إلى صفحة من الكتاب.")
                 elif not ai_ctx.get("sources") or not any(x.get("idx") for x in (ai_ctx.get("sources") or [])):
@@ -1246,11 +1263,17 @@ def _review_section(book, flat_lessons, user, lang, idx=None, comp_idx=None, com
                     st.markdown("**الإجابة:** ")
                     st.markdown(_box(d["model_answer"], lang), unsafe_allow_html=True)
                 src_bits = []
+                imported_source_book = d.get("answer_source_book") or d.get("source_book")
+                imported_source_note = d.get("source_note") or d.get("source_lesson")
+                if imported_source_book:
+                    src_bits.append(str(imported_source_book))
                 if d.get("source_pages"):
-                    src_bits.append("صفحة " + "، ".join(str(p) for p in d["source_pages"]))
+                    src_bits.append("الصفحة المطبوعة " + "، ".join(str(p) for p in d["source_pages"]))
                 lesson_now = None if les == lesson_titles[0] else les
                 if lesson_now:
-                    src_bits.append(lesson_now)
+                    src_bits.append("درس المنهاج المرتبط: " + str(lesson_now))
+                elif imported_source_note:
+                    src_bits.append("تفصيل الدرس في JSON: " + str(imported_source_note))
                 if src_bits:
                     st.caption("📍 المصدر: " + " — ".join(src_bits))
                 if q["qtype"] in ANSWER_TYPES and d.get("ai_answer"):
@@ -1574,8 +1597,8 @@ def render_ministry(book, flat_lessons, user, lang="ar", idx=None, comp_idx=None
             return
         _bank_tab(book, user, False, lang)
         return
-    t1, t2, t4, t5, t6, t3 = st.tabs(["📚 البنك", "⬆️ رفع ومراجعة", "🏦 نقل إلى بنك قيّمني", "📄 نصوص القراءة",
-                                      "📘 شرح القواعد", "🎯 نمط الأسئلة"])
+    t1, t2, t4, t5, t6, t3, t7 = st.tabs(["📚 البنك", "⬆️ رفع ومراجعة", "🏦 نقل إلى بنك قيّمني", "📄 نصوص القراءة",
+                                           "📘 شرح القواعد", "🎯 نمط الأسئلة", "🧠 تحليل الأهداف"])
     with t1:
         _bank_tab(book, user, True, lang)
     with t2:
@@ -1590,3 +1613,6 @@ def render_ministry(book, flat_lessons, user, lang="ar", idx=None, comp_idx=None
         _grammar_section(book, flat_lessons, user, lang, idx)
     with t3:
         _style_section(book, user, lang)
+    with t7:
+        import ministry_analysis
+        ministry_analysis.render_analysis_section(book, lang)
