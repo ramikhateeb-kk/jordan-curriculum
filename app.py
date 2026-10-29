@@ -615,7 +615,7 @@ elif action == "quiz":
             "اختر درسًا أو أكثر (يمكن الجمع بين دروس من وحدات مختلفة)",
             [l["label"] for l in flat_lessons], default=[flat_lessons[0]["label"]])
         chosen = [l for l in flat_lessons if l["label"] in selected]
-        render_quiz(idx, slug, chosen, companion_book=comp_book, companion_idx=comp_idx)
+        render_quiz(idx, slug, chosen)
 
 # ---------------------------------------------------------------- إنشاء اختبار (المعلم)
 elif action == "exam":

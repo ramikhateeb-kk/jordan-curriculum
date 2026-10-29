@@ -15,10 +15,11 @@ import html as _html
 import re as _re
 
 import companion
+import catalog
+import prompts as prompt_store
 import images
 import rag
 import ministry
-import ministry_analysis
 import qbank
 import reading_texts
 import subject_profiles as sp
@@ -35,11 +36,10 @@ QTYPES = {
 
 SYSTEM = (
     "أنت معلم للمنهاج الأردني يضع أسئلة تقويمية دقيقة. التزم بالآتي بصرامة:\n"
-    "1) استخدم مفاهيم وقواعد وأمثلة الكتاب المرفق فقط، ولا تدخل معلومات خارج المنهاج. يجوز إنشاء سؤال جديد يطبق المعرفة الواردة في الدرس في سياق جديد.\n"
-    "2) يجب أن تكون الإجابة قابلة للاشتقاق الصحيح من محتوى الدرس؛ لا تخمّن ولا تختلق معطيات غير مذكورة.\n"
-    "3) اكتب بالعربية الفصحى الواضحة، وضع رقم الصفحة فقط إذا أمكن ربط السؤال بصفحة فعلية من النص.\n"
-    "4) في الاختيار من متعدد اجعل الخيارات الخاطئة معقولة لكنها غير صحيحة، وتأكد من وجود إجابة واحدة صحيحة فقط.\n"
-    "5) في المسائل الرياضية والعلمية، اشرح القانون وخطوات الحل والوحدات في التفسير عند الحاجة.\n"
+    "1) استخدم فقط نص الكتاب المرفق، ولا تستخدم أي معلومة من خارجه، ولا تخترع تفاصيل ليست فيه.\n"
+    "2) يجب أن تكون إجابة السؤال موجودة صراحة في النص المرفق، لا مُستنتجة أو مُخمَّنة.\n"
+    "3) اكتب بالعربية الفصحى الواضحة، وضع رقم الصفحة التي أخذت منها السؤال بدقة.\n"
+    "4) في الاختيار من متعدد اجعل الخيارات الثلاثة الخاطئة معقولة، لكن غير موجودة في النص كإجابة صحيحة.\n"
     "أعد JSON فقط بلا أي نص آخر."
 )
 def _md_u(text):
@@ -54,13 +54,12 @@ def _md_u(text):
 
 SYSTEM_EN = (
     "You are a teacher of the Jordanian curriculum writing accurate assessment questions in English. Follow strictly:\n"
-    "1) Use only concepts, rules and examples supported by the attached lesson; do not introduce knowledge outside the curriculum. New questions may apply taught concepts in a new context.\n"
-    "2) The answer must be derivable correctly from the lesson content. Never guess or invent unsupported data.\n"
-    "3) Write clear English and provide a page number only when it matches an actual supplied page.\n"
-    "4) For multiple choice, make wrong options plausible but incorrect, with exactly one defensible correct answer.\n"
-    "5) For maths and science problems, include the relevant law, solution steps and units in the explanation when applicable.\n"
-    "6) If the prompt explicitly selects both student-book and workbook content, use both as knowledge sources; "
-    "otherwise treat any supplied workbook content only as optional question-style guidance. Never invent page numbers.\n"
+    "1) Use ONLY the attached book text; do not use outside information or invent details.\n"
+    "2) The answer must be explicitly supported by the attached text, not inferred or guessed.\n"
+    "3) Write clear English and give the exact page number you took the question from.\n"
+    "4) For multiple choice, make the three wrong options plausible but not correct according to the text.\n"
+    "5) Practice material from the workbook, if provided, is only a guide to question types and language points; "
+    "the page number must be a page of the book text, never of the workbook.\n"
     "Return JSON only, no other text."
 )
 GRADE_SYSTEM = (
@@ -75,6 +74,7 @@ SPECS_EN = {
     "tf": "a statement the student judges as true or false",
     "fill": "a fill-in-the-blank sentence with exactly one blank written ______ whose answer is a word or short phrase",
     "short": "a short question answered in one or two sentences",
+    "writing": "an extended free-writing task requiring a paragraph, essay, email, report, or other genre explicitly taught in the lesson, with a model response and marking rubric",
 }
 
 SPECS = {
@@ -87,6 +87,8 @@ SPECS = {
              '{"type":"fill","question":"... ______ ...","model_answer":"...","explanation":"...","page":12}'),
     "short": ('سؤال قصير يُجاب عنه بجملة أو جملتين',
               '{"type":"short","question":"...","model_answer":"...","explanation":"...","page":12}'),
+    "writing": ('مهمة كتابة حرة تطلب نصًا ممتدًا من النوع الذي يدرّسه الدرس، مع إجابة نموذجية وسلم تصحيح',
+                 '{"type":"writing","question":"Write ...","model_answer":"A complete model text ...","marking_rubric":{"task_achievement":"...","organisation":"...","grammar":"...","vocabulary":"...","register":"..."},"explanation":"...","page":12}'),
 }
 
 
@@ -117,6 +119,8 @@ def _valid(q, qtype, ctx_pages):
             and isinstance(q.get("correct_index"), int) and 0 <= q["correct_index"] < 4
     if qtype == "tf":
         return isinstance(q.get("correct"), bool)
+    if qtype == "writing":
+        return bool(str(q.get("model_answer", "")).strip()) and isinstance(q.get("marking_rubric", {}), dict)
     return bool(str(q.get("model_answer", "")).strip())
 
 
@@ -134,10 +138,6 @@ def _finalize(q, qtype, lesson=None):
 
 
 def _save(slug, lesson, qtype, q):
-    # لا نخزّن أسئلة المصادر المركبة في بنك الكتاب الرئيسي؛ حتى لا تظهر لاحقًا
-    # عند اختيار الكتاب الرئيسي وحده.
-    if lesson.get("_assessment_source", "main") != "main":
-        return None
     try:
         return qbank.add_question(slug, lesson["start"], lesson["end"], qtype, q)
     except Exception as e:  # noqa: BLE001
@@ -240,54 +240,80 @@ def _generate(client, idx, slug, lesson, qtype, asked_texts, passage=None):
     يعيد (السؤال، معرّفه الجديد في قاعدة البيانات أو None إن تعذّر الحفظ)."""
     desc, schema = SPECS[qtype]
     lang = lesson.get("lang", "ar")
-    style_slug = lesson.get("_assessment_style_slug", slug)
-    source_mode = lesson.get("_assessment_source", "main")
     ctx_pages = select_context(idx, lesson["title"], (lesson["start"], lesson["end"]), max_chars=CONTEXT_BUDGET)
     if not ctx_pages:
         return None, None
-    style = ministry.style_snippet(style_slug, qtype, lang)        # نمط الصياغة الوزارية والأمثلة المعتمدة
-    objective_guidance = ministry_analysis.generation_guidance(style_slug, lang=lang)
-    if objective_guidance:
-        style = (style + "\\n\n" if style else "") + objective_guidance
+    style = ministry.style_snippet(slug, qtype, lang)              # نمط الأسئلة الوزارية (إن وُجد)
     kind = sp.lesson_kind(lesson["title"]) if lang == "en" else None
     stored = reading_texts.texts_of(slug, lesson["title"])         # نصوص قراءة محفوظة لهذا الدرس (آليًا أو يدويًا، أي لغة)
-    if (kind in sp.PASSAGE_KINDS or stored) and source_mode != "both":
+    if kind in sp.PASSAGE_KINDS or stored:
         if sp.READING_MODE == "reference" or lang != "en":         # سؤال يشير إلى النص (الافتراضي)
             res = _generate_reference(client, idx, slug, lesson, qtype, asked_texts, style, lang)
         else:                                                      # عرض قطعة حرفية ثم سؤال عليها
             res = _generate_passage(client, idx, slug, lesson, qtype, asked_texts, passage, style)
         if res is not None:
             return res
-    practice = companion.exercises_text(lesson)                    # محتوى الدرس المقابل في الكتاب المرافق
+    practice = companion.exercises_text(lesson)                    # تمارين الكتاب المرافق (إن وُجد نظير للدرس)
     asked = "\n".join(f"- {a}" for a in asked_texts) or ("none" if lang == "en" else "لا يوجد")
     if lang == "en":
         ctx = "\n\n".join(f"=== Page {p['page']} ===\n{p['text']}" for p in ctx_pages)
+        # استرجاع برومت التقييم المحفوظ حسب المبحث والصف والفصل؛ لا يعتمد على برومت ثابت داخل الكود فقط.
+        try:
+            _book = next((b for b in catalog.list_books() if b.get("slug") == slug and not b.get("parent_slug")), {})
+            _subject_prompt = prompt_store.get_prompt(_book.get("subject", "English Language"),
+                                                      _book.get("grade", 11), _book.get("semester", 1), slug=slug)
+        except Exception as _prompt_error:
+            print("تعذّر تحميل برومت المبحث، سيستخدم النظام تعليمات الإنجليزية الافتراضية:", _prompt_error)
+            _subject_prompt = prompt_store.DEFAULT_EN_G11_PROMPT
+        # Prompt مخصص لمبحث اللغة الإنجليزية/الصف الأول الثانوي، مع تمرير الدرس المرتبط من كتاب الأنشطة عند توفره.
+        lesson_type = "TYPE A — comprehensive (reading/writing workshop)" if kind in ("reading", "writing", "culture", "literature") else "TYPE B — focused language lesson"
         prompt = (
-            f"Lesson: {lesson['title']}\n\nBook text (the only permitted source):\n{ctx}\n\n"
-            + (f"\n\nRelated workbook content (USE AS AN ADDITIONAL KNOWLEDGE SOURCE, not only as a style guide):\n{practice}\n\n" if practice and source_mode == "both" else "")
-            + (f"{style}\n\n" if style else "")
-            + f"Subject-specific prompt guidance for this lesson type:\n{sp.en_guidance(kind)}\n\n"
-            + f"The requested question format is fixed by the assessment setting: {SPECS_EN[qtype]}. Follow this format exactly. Use the lesson-type guidance above to choose the appropriate knowledge/skill and Ministry-style wording, but do NOT override the requested format or assume a different question type.\n"
-            + "Create the question based on the selected source content only.\n"
-            + ("Use both the student-book text and the related workbook content as sources of assessable knowledge. You may create new questions applying taught concepts in new examples. If the answer is supported only by the workbook, set page to null because the current displayed page reference belongs to the main book.\n" if source_mode == "both" else "")
-            + f"Do not repeat these existing questions for this lesson:\n{asked}\n\n"
-            f"Return JSON in exactly this format:\n{schema}")
-        system = sp.SYSTEM_EN
+            f"Subject: English Language — Jordan High Note, Grade 11 (Tawjihi 2025/2026)\n"
+            f"Unit/Lesson: {lesson['title']}\nLesson classification hint: {lesson_type}\n"
+            f"Requested item type: {SPECS_EN[qtype]}\n\n"
+            f"STUDENT'S BOOK — primary curriculum source; page numbers below are the indexed book pages:\n{ctx}\n\n"
+            + (f"LINKED WORKBOOK LESSON — paired by unit/lesson number; use to identify aligned practice, exceptions and question styles. "
+               f"Do not silently attribute workbook material to the Student's Book:\n{practice}\n\n" if practice else
+               "No matching Workbook lesson was found. Use the Student's Book only and do not claim that a Workbook source exists.\n\n")
+            + (f"Official Ministry-style reference (style guidance only):\n{style}\n\n" if style else "")
+            + f"LESSON-SPECIFIC QUESTION PATTERN GUIDANCE:\n{sp.en_guidance(kind)}\n\n"
+            + f"ACTIVE SUBJECT PROMPT FROM THE ADMIN DATABASE (authoritative subject-specific policy):\n{_subject_prompt}\n\n"
+            + "Rules: focused grammar/vocabulary/functions lessons produce MCQs only; a lesson whose actual task is free writing MUST produce a writing task, not an MCQ. "
+            + "For any MCQ, provide exactly four distinct options and exactly one correct answer. "
+            "Use a contextual clue in each newly written sentence; distractors should reflect common learner errors. Do not create an outside reading passage. "
+            "For Reading questions, use only the actual textbook passage and follow the app's short-answer reading mode. "
+            "Provide a concise explanation/rationale and a real printed page reference; never invent page numbers. "
+            "If the answer is supported by Student's Book text, set source_book to 'Student's Book'. If the item genuinely depends on a Workbook page, "
+            "set source_book to 'Workbook'. Add source_page only when that printed page is explicitly identifiable in the supplied material. "
+            "The app's current schema uses page for the verified Student's Book page; keep page valid and do not substitute a Workbook page into it.\n\n"
+            f"Do not repeat these existing questions for this lesson:\n{asked}\n\n"
+            f"Return JSON in exactly this format (add source_book and source_page only when verifiable):\n{schema}")
+        system = sp.SYSTEM_EN + "\n\nADMIN-DEFINED SUBJECT PROMPT: Follow this prompt for lesson-type decisions and output behavior, together with the exact JSON schema supplied in the user prompt.\n" + _subject_prompt
     else:
         ctx = "\n\n".join(f"=== صفحة {p['page']} ===\n{p['text']}" for p in ctx_pages)
         prompt = (
             f"الدرس: {lesson['title']}\n\nنص من الكتاب (المصدر الوحيد المسموح به):\n{ctx}\n\n"
-            + (f"محتوى الدرس المقابل في الكتاب المرافق (مصدر معرفي إضافي، وليس مجرد نموذج للأسئلة):\n{practice}\n\n" if practice and source_mode == "both" else "")
+            + (f"تمارين الكتاب المرافق لهذا الدرس (للاسترشاد بأنواع الأسئلة فقط، ورقم الصفحة من الكتاب الأساسي):\n{practice}\n\n" if practice else "")
             + (f"{style}\n\n" if style else "")
-            + f"نوع السؤال المطلوب محدد من إعداد التقييم: {desc}. التزم بهذا النوع حرفيًا، واستخدم توجيهات المبحث ونمطه الوزاري لتحديد المهارة والمحتوى والصياغة، دون استبدال نوع السؤال أو افتراض نوع آخر.\n"
-            + "أنشئ السؤال اعتمادًا على محتوى المصدر المحدد فقط.\n"
-            + ("استخدم محتوى الكتاب الرئيسي والدرس المقابل في الكتاب المرافق معًا. يجوز صياغة سؤال جديد يطبق ما تعلمه الطالب في مثال مختلف. إذا كانت الإجابة مدعومة من الكتاب المرافق فقط، اجعل page = null لأن أرقام الصفحات المعروضة هنا تخص الكتاب الرئيسي.\n" if source_mode == "both" else "")
-            + f"لا تكرر هذه الأسئلة الموجودة سلفًا لهذا الدرس:\n{asked}\n\n"
+            + f"أنشئ {desc}، اعتمادًا على هذا النص فقط.\n"
+            f"لا تكرر هذه الأسئلة الموجودة سلفًا لهذا الدرس:\n{asked}\n\n"
             f"أعد JSON بهذا الشكل بالضبط:\n{schema}")
-        system = SYSTEM
+        try:
+            _book = next((b for b in catalog.list_books() if b.get("slug") == slug and not b.get("parent_slug")), {})
+            _subject_prompt = prompt_store.get_prompt(_book.get("subject", lesson.get("subject", "")),
+                                                      _book.get("grade", 0), _book.get("semester", 1), slug=slug)
+        except Exception as _prompt_error:
+            print("تعذّر تحميل برومت المبحث:", _prompt_error)
+            _subject_prompt = "استخدم نص المنهاج المرفق فقط، والتزم بنوع السؤال المطلوب ومخطط JSON المحدد."
+        system = SYSTEM + "\n\nتعليمات المبحث المحفوظة في قاعدة البيانات: اتبعها مع الالتزام بمخطط JSON المرسل.\n" + _subject_prompt
     for _ in range(2):
         q = _json(client, system, prompt)
         if _valid(q, qtype, ctx_pages) and not ministry.too_similar(slug, str(q.get("question", ""))):
+            _finalize(q, qtype, lesson)
+            # لا نعرض مرجعًا اختلقه النموذج: التحقق الحالي يثبت صفحة السؤال من صفحات Student's Book فقط.
+            # صفحات Workbook تُستخدم للمطابقة ونمط التمرين، ولا تُنسب إليها الإجابة ما لم يوجد تحقق مستقل لها.
+            q["source_book"] = "Student's Book"
+            q["source_page"] = q.get("page_printed") or q.get("page")
             _finalize(q, qtype, lesson)
             return q, _save(slug, lesson, qtype, q)
     return None, None
@@ -304,17 +330,43 @@ def _plain(text):
     return re.sub(r"\[\[(.+?)\]\]", r"\1", str(text), flags=re.S)
 
 
+def _english_assessment_type(slug, lesson):
+    """اختيار نوع السؤال بحسب محتوى الدرس: قراءة=قصير، كتابة حرة=writing، وبقية دروس اللغة=MCQ."""
+    title = str(lesson.get("title", ""))
+    is_english = "english" in str(slug or "").lower() or bool(re.search(r"\b(reading|vocabulary|grammar|listening|writing|speaking)\b", title, re.I))
+    if not is_english:
+        # اسم المبحث قد يكون في سجل الكتاب بينما المعرّف مشفر؛ يُتحقق منه في قاعدة الكتب.
+        try:
+            book = next((b for b in catalog.list_books() if b.get("slug") == slug), {})
+            is_english = book.get("lang") == "en"
+        except Exception:
+            pass
+    if not is_english:
+        return None
+    kind = sp.lesson_kind(title)
+    if kind == "reading":
+        return "short"
+    if kind == "writing":
+        return "writing"
+    return "mcq"
+
+
 def next_question(client, idx, slug, lessons, quiz):
-    """يستخدم نوع السؤال الذي اختاره الطالب، ولا يفرض نوعًا تلقائيًا اعتمادًا على عنوان الدرس.
-    تبقى تعليمات المبحث وأنماط أسئلته الوزارية مرفقة ببرومت التوليد لتوجيه المحتوى والصياغة."""
-    source_mode = quiz.get("source_mode", "main")
-    qtype = quiz["qtype"] if quiz["qtype"] != "mixed" else random.choice(["mcq", "tf", "fill", "short"])
+    """يفحص أولًا قاعدة الأسئلة عبر الدروس المطلوبة، ويختار سؤالًا غير مستخدم إن وُجد.
+    في تقييم الإنجليزية يُفرض short على دروس Reading وmcq على بقية الدروس، حتى عند اختيار عدة دروس."""
+    if quiz.get("qtype") == "english_auto":
+        possible = { _english_assessment_type(slug, lesson) for lesson in lessons }
+        possible.discard(None)
+        qtype = random.choice(sorted(possible)) if possible else "mcq"
+        lessons = [lesson for lesson in lessons if _english_assessment_type(slug, lesson) == qtype]
+    else:
+        qtype = quiz["qtype"] if quiz["qtype"] != "mixed" else random.choice(["mcq", "tf", "fill", "short"])
 
     # --- 1) سؤال آخر على القطعة الحالية
     ps = quiz.get("passage")
     lesson_p = next((l for l in lessons if ps and l["title"] == ps["lesson"]), None)
     if ps and lesson_p and ps["n"] < PASSAGE_REUSE:
-        bank = qbank.list_questions(slug, lesson_p["start"], lesson_p["end"], qtype) if source_mode == "main" else []
+        bank = qbank.list_questions(slug, lesson_p["start"], lesson_p["end"], qtype)
         same = [(qid, d) for qid, d in bank if _base_key(d) == ps["key"] and qid not in quiz["asked_ids"]
                 and d.get("question") not in quiz["asked_texts"]]
         if same:
@@ -337,7 +389,7 @@ def next_question(client, idx, slug, lessons, quiz):
     seen = quiz.setdefault("seen_passages", set())
     pool = []
     for lesson in lessons:
-        bank = qbank.list_questions(slug, lesson["start"], lesson["end"], qtype) if source_mode == "main" else []
+        bank = qbank.list_questions(slug, lesson["start"], lesson["end"], qtype)
         pool += [(lesson, qid, data) for qid, data in bank
                 if qid not in quiz["asked_ids"] and data.get("question") not in quiz["asked_texts"]]
     fresh = [p for p in pool if not p[2].get("passage_key") or _base_key(p[2]) not in seen] or pool
@@ -384,9 +436,12 @@ def grade(client, q, ans):
         return (1.0 if (ans == "صح") == q["correct"] else 0.0), ""
     prompt = (
         f"السؤال: {q['question']}\nالإجابة النموذجية: {q['model_answer']}\n"
-        f"توضيح إضافي: {q.get('explanation', '')}\nإجابة الطالب: {ans}\n\n"
-        "الدرجة: 1 إن كانت صحيحة (يُقبل اختلاف الصياغة والمرادفات مع بقاء المعنى صحيحًا)، "
-        "0.5 إن كانت صحيحة جزئيًا أو ناقصة، 0 إن كانت خاطئة. "
+        f"توضيح إضافي: {q.get('explanation', '')}\n"
+        f"سلم تصحيح الكتابة إن وجد: {json.dumps(q.get('marking_rubric', {}), ensure_ascii=False)}\n"
+        f"إجابة الطالب: {ans}\n\n"
+        "قيّم المعنى والمحتوى والتنظيم والقواعد والمفردات ومدى الالتزام بالمطلوب عند وجود مهمة كتابة حرة. "
+        "لا تشترط مطابقة الإجابة النموذجية حرفيًا، واقبل الإجابات الصحيحة البديلة. "
+        "الدرجة: 1 إن كانت الإجابة صحيحة ومكتملة، 0.5 إن كانت صحيحة جزئيًا أو ناقصة، 0 إن كانت خاطئة أو خارج المطلوب. "
         'أعد JSON: {"score": 1, "feedback": "ملاحظة قصيرة ومشجعة"}')
     r = _json(client, GRADE_SYSTEM, prompt, temperature=0) or {}
     try:
@@ -396,18 +451,14 @@ def grade(client, q, ans):
     return max(0.0, min(1.0, score)), str(r.get("feedback", ""))
 
 
-def render_quiz(idx, slug, lessons, companion_book=None, companion_idx=None):
-    """تقييم محتوى الكتاب الرئيسي، أو الكتاب المرافق، أو دمجهما عند توفر الربط."""
+def render_quiz(idx, slug, lessons):
+    """lessons: قائمة [{"title","start","end"}] اختارها الطالب، ويمكن أن تكون من وحدات مختلفة."""
     S = st.session_state
     if not lessons:
         st.info("اختر درسًا واحدًا على الأقل لتبدأ.")
         return
 
-    source_options = ["الكتاب الرئيسي فقط"]
-    if companion_book and companion_idx is not None:
-        source_options += ["الكتاب المرافق فقط", "الكتاب الرئيسي والكتاب المرافق"]
-    source_label_to_key = {"الكتاب الرئيسي فقط": "main", "الكتاب المرافق فقط": "companion", "الكتاب الرئيسي والكتاب المرافق": "both"}
-    sig = (tuple(sorted((l["start"], l["end"]) for l in lessons)), tuple(source_options))
+    sig = tuple(sorted((l["start"], l["end"]) for l in lessons))
     if S.get("quiz_sig") != sig:
         S.pop("quiz", None)
         S["quiz_sig"] = sig
@@ -416,26 +467,24 @@ def render_quiz(idx, slug, lessons, companion_book=None, companion_idx=None):
     if quiz is None:
         st.subheader("اختبر نفسك")
         st.caption("الدروس المختارة: " + "، ".join(l["title"] for l in lessons))
-        source_label = st.selectbox("مصدر الأسئلة", source_options,
-                                   help="عند الدمج، تُستخدم معلومات الكتاب المرافق في صياغة الأسئلة، لا لمجرد تقليد شكلها.")
-        source_mode = source_label_to_key[source_label]
-        linked_count = sum(1 for lesson in lessons if lesson.get("companion_key") and lesson.get("companion_pages"))
-        if source_mode == "both" and linked_count < len(lessons):
-            st.info("بعض الدروس المختارة لا يوجد لها درس مقابل معروف في الكتاب المرافق؛ ستُولّد أسئلتها من الكتاب الرئيسي فقط.")
-        if source_mode == "companion" and linked_count == 0:
-            st.warning("الدروس المختارة لا تحتوي على روابط لدروس مقابلة في الكتاب المرافق؛ اختر مصدرًا آخر أو دروسًا مرتبطة.")
-        qt_label = st.selectbox(
-            "نوع الأسئلة",
-            list(QTYPES),
-            help=("اختر شكل السؤال الذي تريده. لن يفرض النظام نوعًا تلقائيًا بناءً على عنوان الدرس؛ "
-                  "بل سيستخدم برومت المبحث وتوجيهاته لتحديد المحتوى وطريقة صياغة السؤال ضمن النوع المختار.")
-        )
-        qt = QTYPES[qt_label]
-        st.caption("سيُراعى برومت المبحث وأنماط أسئلته عند صياغة السؤال، مع الالتزام بنوع السؤال الذي اخترته.")
+        english_types = [_english_assessment_type(slug, lesson) for lesson in lessons]
+        is_english_assessment = all(t is not None for t in english_types)
+        if is_english_assessment:
+            unique_types = set(english_types)
+            if unique_types == {"short"}:
+                st.info("نوع الأسئلة محدد تلقائيًا: أسئلة فهم مقروء قصيرة، لأن الدرس من نوع Reading.")
+            elif unique_types == {"writing"}:
+                st.info("نوع الأسئلة محدد تلقائيًا: مهمة كتابة حرة مع نموذج إجابة وسلم تصحيح، وليست اختيارًا من متعدد.")
+            elif unique_types == {"mcq"}:
+                st.info("نوع الأسئلة محدد تلقائيًا: اختيار من متعدد للدروس المركزة على القواعد والمفردات والوظائف اللغوية.")
+            else:
+                st.info("نوع السؤال يتبع الدرس: Reading = سؤال قصير، Writing = كتابة حرة، والدروس اللغوية المركزة = اختيار من متعدد.")
+            qt = "english_auto"
+        else:
+            qt = QTYPES[st.selectbox("نوع الأسئلة", list(QTYPES))]
         n = st.number_input("عدد الأسئلة", min_value=1, value=5, step=1)
         if st.button("ابدأ التقييم", type="primary"):
-            S["quiz"] = {"qtype": qt, "n": int(n), "i": 0, "score": 0.0,
-                         "source_mode": source_mode,
+            S["quiz"] = {"qtype": qt if is_english_assessment else qt, "n": int(n), "i": 0, "score": 0.0,
                          "asked_ids": set(), "asked_texts": [], "cur": None, "res": None, "hist": []}
             st.rerun()
         return
@@ -461,30 +510,10 @@ def render_quiz(idx, slug, lessons, companion_book=None, companion_idx=None):
             st.rerun()
         return
 
-    source_mode = quiz.get("source_mode", "main")
-    quiz_idx, quiz_slug = idx, slug
-    assessment_lessons = []
-    for original in lessons:
-        lesson = dict(original)
-        lesson["_assessment_source"] = source_mode
-        lesson["_assessment_style_slug"] = slug
-        if source_mode == "companion":
-            pages = lesson.get("companion_pages")
-            if not pages or companion_idx is None:
-                continue
-            lesson["start"], lesson["end"] = pages
-            lesson["page_offset"] = companion_book.get("page_offset", 0) if companion_book else 0
-            lesson["lang"] = companion_book.get("lang", lesson.get("lang", "ar")) if companion_book else lesson.get("lang", "ar")
-            quiz_idx, quiz_slug = companion_idx, companion_book["slug"]
-        assessment_lessons.append(lesson)
-    if not assessment_lessons:
-        st.warning("لا توجد دروس مقابلة في الكتاب المرافق ضمن اختيارك. اختر الكتاب الرئيسي أو دروسًا مرتبطة.")
-        return
-
     client = get_client()
     if quiz["cur"] is None:
         with st.spinner("جارٍ إعداد السؤال..."):
-            quiz["cur"] = next_question(client, quiz_idx, quiz_slug, assessment_lessons, quiz)
+            quiz["cur"] = next_question(client, idx, slug, lessons, quiz)
         if quiz["cur"] is None:
             if rag.recent_quota_error():
                 st.error("تم تجاوز الحد المسموح لاستخدام الذكاء الاصطناعي مؤقتًا في كل النماذج المتاحة. حاول بعد دقيقة.")
@@ -496,8 +525,6 @@ def render_quiz(idx, slug, lessons, companion_book=None, companion_idx=None):
         quiz["asked_texts"].append(quiz["cur"]["question"])
     q = quiz["cur"]
 
-    source_labels = {"main": "الكتاب الرئيسي", "companion": "الكتاب المرافق", "both": "الكتاب الرئيسي والكتاب المرافق"}
-    st.caption("مصدر التقييم: " + source_labels.get(source_mode, "الكتاب الرئيسي"))
     st.progress(quiz["i"] / quiz["n"])
     st.markdown(f"**السؤال {quiz['i'] + 1} من {quiz['n']}** — {q.get('_lesson', '')}")
     if q.get("ref_title"):                         # سؤال على نص قراءة: يُذكر اسمه وصفحته، والنص الكامل عند الطلب
@@ -555,8 +582,13 @@ def render_quiz(idx, slug, lessons, companion_book=None, companion_idx=None):
     st.write(f"الإجابة الصحيحة: {correct_text(q)}")
     if q.get("explanation"):
         _pg = q.get("page_printed") or q.get("page")
-        page = f" (صفحة {_pg})" if _pg else ""
+        _src = str(q.get("source_book") or "Student's Book")
+        page = f" — {_src}, page {q.get('source_page')}" if q.get("source_page") else (f" — {_src}, page {_pg}" if _pg else f" — {_src}; page not verified")
         st.info(f"{q['explanation']}{page}")
+    elif q.get("source_book") or q.get("source_page"):
+        _src = str(q.get("source_book") or "Source not verified")
+        _spage = q.get("source_page")
+        st.caption(f"Source: {_src}" + (f", page {_spage}" if _spage else "; page not verified"))
     if res["fb"]:
         st.caption(res["fb"])
     last = quiz["i"] + 1 >= quiz["n"]
