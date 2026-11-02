@@ -196,7 +196,7 @@ def default_title(d):
     return " — ".join(x for x in (unit, asg) if x) or "واجب BTEC"
 
 
-def create_assignment(user, items, grade, track_id, replace_id=None):
+def create_assignment(user, items, grade, track_id, replace_id=None, subject_id=None):
     """يعيد {"status": "created"|"exists"|"unreadable", ...}. يُحتسب طلب واحد من الحصة اليومية."""
     auth_ui.require_quota_or_stop(user)
     data = btec_ai.extract_data(items)
@@ -242,7 +242,7 @@ def create_assignment(user, items, grade, track_id, replace_id=None):
 
     row = {"guide_key": key, "grade": grade, "track_id": track_id, "title": default_title(data), "data": data,
            "student_guide": md, "teacher_explain": None, "images": gen, "source_images": src_images,
-           "documents": docs, "created_by": user["id"], "published": True}
+           "documents": docs, "created_by": user["id"], "published": True, "subject_id": subject_id}
     if replace_id is not None:
         old = store.assignment(replace_id)
         row["title"] = (old or {}).get("title") or row["title"]
@@ -287,14 +287,75 @@ def _criteria(a):
     return [c for c in ((a.get("data") or {}).get("criteria") or []) if c.get("code")]
 
 
+# ================================================================ المباحث (تُضاف من المدير بلا أي كتاب)
+def _subject_picker(track_id, key, published_only=False, grade=None, allow_all=False):
+    """يعيد "all" | "none" | رقم المبحث. إن لم تُعرَّف مباحث للتخصص يعيد "all" دون عرض شيء."""
+    subs = store.subjects_for(track_id)
+    has_none = bool(store.assignments_for(grade, track_id, published_only, columns="id", subject="none")) if grade else False
+    if not subs:
+        return "all"
+    opts = ([("all", "كل المباحث")] if allow_all else []) + [(s["id"], s["name"]) for s in subs] + ([("none", "واجبات بلا مبحث")] if has_none else [])
+    pick = st.selectbox("المبحث", [o[0] for o in opts], key=key, format_func=lambda v: dict(opts)[v])
+    return pick
+
+
+def render_subjects_admin(tracks):
+    st.subheader("📘 مباحث BTEC")
+    st.caption("أضف أسماء المباحث لكل صف وتخصص مباشرة، ولا حاجة لرفع أي كتاب. تُربط الواجبات بالمبحث عند رفعها، ويختار الطالب مبحثه ثم واجبه.")
+    bt = btec_tracks(tracks)
+    if not bt:
+        st.warning("لا توجد تخصصات BTEC. شغّل supabase_btec.sql أولًا.")
+        return
+    tid = st.selectbox("الصف / التخصص", [t["id"] for t in bt], key="btec_subj_track",
+                       format_func=lambda t: scope_label(tracks, next(x["grade"] for x in bt if x["id"] == t), t))
+    track = next(t for t in bt if t["id"] == tid)
+
+    cur = store.subjects_for(tid, active_only=False)
+    for sj in cur:
+        c1, c2, c3 = st.columns([5, 2, 1])
+        new_name = c1.text_input("اسم المبحث", value=sj["name"], key=f"btec_sj_n_{sj['id']}", label_visibility="collapsed")
+        active = c2.checkbox("فعّال", value=sj["active"], key=f"btec_sj_a_{sj['id']}")
+        if c3.button("💾", key=f"btec_sj_s_{sj['id']}", help="حفظ التعديل"):
+            store.update("btec_subjects", {"id": sj["id"]}, {"name": new_name.strip() or sj["name"], "active": active})
+            st.rerun()
+        with st.expander(f"🗑️ حذف «{sj['name']}»", expanded=False):
+            n = len(store.select("btec_assignments", {"subject_id": sj["id"]}, columns="id"))
+            st.caption(f"سيُحذف المبحث فقط؛ الواجبات المرتبطة به ({n}) تبقى وتظهر ضمن «واجبات بلا مبحث».")
+            if st.checkbox("أؤكد الحذف", key=f"btec_sj_c_{sj['id']}") and st.button("حذف", key=f"btec_sj_d_{sj['id']}"):
+                store.delete("btec_subjects", {"id": sj["id"]})
+                st.rerun()
+    if not cur:
+        st.info("لا توجد مباحث لهذا الصف/التخصص بعد.")
+
+    st.markdown("**إضافة مباحث** (اسم في كل سطر)")
+    names = st.text_area("أسماء المباحث", key=f"btec_sj_new_{tid}", height=110, label_visibility="collapsed")
+    others = [t for t in bt if t["name"] == track["name"] and t["id"] != tid]
+    also = st.checkbox("أضفها أيضًا لنفس التخصص في باقي الصفوف (" + "، ".join(GRADES[t["grade"] - 1] for t in others) + ")",
+                       key=f"btec_sj_also_{tid}") if others else False
+    if st.button("➕ إضافة", type="primary", key=f"btec_sj_add_{tid}"):
+        lines = [x.strip() for x in names.splitlines() if x.strip()]
+        if not lines:
+            st.error("اكتب اسم مبحث واحد على الأقل.")
+        else:
+            for t in [track] + (others if also else []):
+                exist = {s["name"] for s in store.subjects_for(t["id"], active_only=False)}
+                base = len(exist)
+                rows = [{"grade": t["grade"], "track_id": t["id"], "name": n, "sort_order": base + i, "active": True}
+                        for i, n in enumerate(dict.fromkeys(lines)) if n not in exist]
+                store.upsert("btec_subjects", rows, "track_id,name")
+            st.success("تمت الإضافة.")
+            st.rerun()
+
+
 # ================================================================ الطالب
 def render_student(user, tracks):
     grade, track_id = user["grade"], user.get("track_id")
     st.markdown("### 🎓 مساعد BTEC")
     st.markdown(f"**الصف:** {scope_label(tracks, grade, track_id)}")
-    rows = store.assignments_for(grade, track_id, published_only=True, columns="id,title")
+    subj = _subject_picker(track_id, key="btec_stu_subj", published_only=True, grade=grade)
+    rows = store.assignments_for(grade, track_id, published_only=True, columns="id,title", subject=subj)
     if not rows:
-        st.info("لم تُضف واجبات لصفك وتخصصك بعد. سيظهر هنا كل واجب بمجرد أن يرفعه المشرف.")
+        st.info("لا توجد واجبات منشورة لهذا المبحث بعد. سيظهر هنا كل واجب بمجرد أن يرفعه المشرف.")
         return
     pick = st.selectbox("اختر الواجب", [r["id"] for r in rows], format_func=lambda i: next(r["title"] for r in rows if r["id"] == i))
     a = store.assignment(pick)
@@ -359,8 +420,8 @@ def _students(grade, track_id):
     return names
 
 
-def _pick_assignment(grade, track_id, key, published_only=False):
-    rows = store.assignments_for(grade, track_id, published_only=published_only, columns="id,title,published")
+def _pick_assignment(grade, track_id, key, published_only=False, subj="all"):
+    rows = store.assignments_for(grade, track_id, published_only=published_only, columns="id,title,published", subject=subj)
     if not rows:
         st.info("لا توجد واجبات لهذا الصف/التخصص بعد.")
         return None
@@ -383,25 +444,36 @@ def render_staff(user, tracks):
                        format_func=lambda t: scope_label(tracks, bt[t]["grade"], t) + ("  •  مشرف" if role_of[t] == "supervisor" and not is_admin else ""))
     grade, is_sup = bt[sel]["grade"], role_of[sel] == "supervisor"
 
+    subj = _subject_picker(sel, key=f"btec_staff_subj_{sel}", grade=grade, allow_all=True)
+
     names = (["📤 رفع واجب"] if is_sup else []) + ["📚 الواجبات", "🧑‍🏫 دليل شرح الواجب", "📈 متابعة التقدم", "🔎 فحص الأدلة"]
     tabs = dict(zip(names, st.tabs(names)))
 
     if is_sup:
         with tabs["📤 رفع واجب"]:
-            _tab_upload(user, grade, sel)
+            _tab_upload(user, grade, sel, subj)
     with tabs["📚 الواجبات"]:
-        _tab_assignments(grade, sel, is_sup)
+        _tab_assignments(grade, sel, is_sup, subj)
     with tabs["🧑‍🏫 دليل شرح الواجب"]:
-        _tab_teacher_explain(user, grade, sel)
+        _tab_teacher_explain(user, grade, sel, subj)
     with tabs["📈 متابعة التقدم"]:
-        _tab_progress(user, grade, sel)
+        _tab_progress(user, grade, sel, subj)
     with tabs["🔎 فحص الأدلة"]:
-        _tab_evidence(user, grade, sel)
+        _tab_evidence(user, grade, sel, subj)
 
 
-def _tab_upload(user, grade, track_id):
+def _tab_upload(user, grade, track_id, subj="all"):
     st.caption("ارفع صور الواجب أو ملفه (PDF/Word). سيُستخرج الواجب ومعاييره ويُولَّد دليل الطالب بنصه وصوره، ثم يُخزَّن ليختاره الطلاب. "
                "يُحتسب طلب واحد من حصتك اليومية.")
+    subs = store.subjects_for(track_id)
+    subject_id = None
+    if subs:
+        ids = [s["id"] for s in subs]
+        subject_id = st.selectbox("المبحث", ids, key=f"btec_up_subj_{track_id}",
+                                  index=ids.index(subj) if subj in ids else 0,
+                                  format_func=lambda i: next(s["name"] for s in subs if s["id"] == i))
+    else:
+        st.info("لم تُعرَّف مباحث لهذا الصف/التخصص؛ سيُحفظ الواجب بلا مبحث. يضيف المدير المباحث من «📘 مباحث BTEC».")
     ups = st.file_uploader("ملفات الواجب", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"],
                            accept_multiple_files=True, key="btec_up")
     replace_id = st.session_state.pop("btec_replace", None)
@@ -412,7 +484,7 @@ def _tab_upload(user, grade, track_id):
             return
         with st.spinner("جارٍ تحليل الواجب وإعداد الدليل والصور... قد يستغرق ذلك عدة دقائق."):
             try:
-                res = create_assignment(user, items, grade, track_id, replace_id=replace_id)
+                res = create_assignment(user, items, grade, track_id, replace_id=replace_id, subject_id=subject_id)
             except Exception as e:  # noqa: BLE001
                 st.error(f"حدث خطأ أثناء المعالجة: {e}")
                 return
@@ -432,17 +504,24 @@ def _tab_upload(user, grade, track_id):
             show_guide(res["assignment"], staff=True)
 
 
-def _tab_assignments(grade, track_id, is_sup):
-    a = _pick_assignment(grade, track_id, "btec_view_pick")
+def _tab_assignments(grade, track_id, is_sup, subj="all"):
+    a = _pick_assignment(grade, track_id, "btec_view_pick", subj=subj)
     if not a:
         return
     if is_sup:
         with st.expander("⚙️ إدارة هذا الواجب"):
             title = st.text_input("عنوان الواجب (يظهر للطلاب)", value=a["title"], key=f"btec_t_{a['id']}")
             pub = st.checkbox("منشور للطلاب", value=a["published"], key=f"btec_p_{a['id']}")
+            subs = store.subjects_for(track_id)
+            new_subj = a.get("subject_id")
+            if subs:
+                opts = [None] + [s["id"] for s in subs]
+                new_subj = st.selectbox("المبحث", opts, index=opts.index(a.get("subject_id")) if a.get("subject_id") in opts else 0,
+                                        key=f"btec_sj_{a['id']}",
+                                        format_func=lambda i: "بلا مبحث" if i is None else next(s["name"] for s in subs if s["id"] == i))
             c1, c2 = st.columns(2)
             if c1.button("💾 حفظ التعديلات", key=f"btec_s_{a['id']}"):
-                store.update("btec_assignments", {"id": a["id"]}, {"title": title.strip() or a["title"], "published": pub})
+                store.update("btec_assignments", {"id": a["id"]}, {"title": title.strip() or a["title"], "published": pub, "subject_id": new_subj})
                 st.rerun()
             sure = c2.checkbox("أؤكد الحذف النهائي (مع متابعة التقدم والفحوص)", key=f"btec_d_{a['id']}")
             if c2.button("🗑️ حذف الواجب", disabled=not sure, key=f"btec_del_{a['id']}"):
@@ -451,8 +530,8 @@ def _tab_assignments(grade, track_id, is_sup):
     show_guide(a, staff=True)
 
 
-def _tab_teacher_explain(user, grade, track_id):
-    a = _pick_assignment(grade, track_id, "btec_exp_pick")
+def _tab_teacher_explain(user, grade, track_id, subj="all"):
+    a = _pick_assignment(grade, track_id, "btec_exp_pick", subj=subj)
     if not a:
         return
     if not a.get("teacher_explain"):
@@ -472,8 +551,8 @@ def _tab_teacher_explain(user, grade, track_id):
     rich_text.show(a["teacher_explain"], "rtl")
 
 
-def _tab_progress(user, grade, track_id):
-    a = _pick_assignment(grade, track_id, "btec_prog_pick")
+def _tab_progress(user, grade, track_id, subj="all"):
+    a = _pick_assignment(grade, track_id, "btec_prog_pick", subj=subj)
     if not a:
         return
     crit = _criteria(a)
@@ -524,8 +603,8 @@ def _tab_progress(user, grade, track_id):
                        file_name=f"btec_progress_{a['id']}.csv", mime="text/csv", key=f"btec_csv_{a['id']}")
 
 
-def _tab_evidence(user, grade, track_id):
-    a = _pick_assignment(grade, track_id, "btec_ev_pick")
+def _tab_evidence(user, grade, track_id, subj="all"):
+    a = _pick_assignment(grade, track_id, "btec_ev_pick", subj=subj)
     if not a:
         return
     crit = _criteria(a)
