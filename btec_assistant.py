@@ -92,5 +92,17 @@ def _pdf_pages_png(data):
         import fitz
     except ImportError:
         return []
+
     pages = []
+
     with fitz.open(stream=data, filetype="pdf") as pdf:
+        for i, page in enumerate(pdf):
+            if i >= MAX_PDF_PAGES:
+                break
+
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(1.4, 1.4)
+            )
+            pages.append(pixmap.tobytes("png"))
+
+    return pages
