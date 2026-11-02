@@ -85,15 +85,17 @@ def make_image(prompt):
     return None
 
 
-def teacher_explain(data, guide_md):
+def teacher_explain(data, guide_md, notes=None):
     body = ("بيانات الواجب:\n" + json.dumps(data, ensure_ascii=False) +
+            (f"\n\nملاحظات المشرف المهمة على الواجب:\n{notes}" if notes else "") +
             "\n\nدليل الطالب المعدّ لهذا الواجب:\n" + guide_md)
     res = _gen([body], system_instruction=BTEC_TEACHER_EXPLAIN_PROMPT, temperature=0.3)
     return (res.text or "").strip()
 
 
-def review_evidence(data, items, student_name=""):
+def review_evidence(data, items, student_name="", notes=None):
     head = ("بيانات الواجب ومعاييره (JSON):\n" + json.dumps(data, ensure_ascii=False) +
+            (f"\n\nملاحظات المشرف المهمة على الواجب (راعها عند الحكم):\n{notes}" if notes else "") +
             (f"\n\nاسم الطالب: {student_name}" if student_name else "") + "\n\nأدلة الطالب المرفقة:")
     d = _json(_gen([head] + parts(items), system_instruction=BTEC_EVIDENCE_PROMPT, temperature=0,
                    response_mime_type="application/json").text)
