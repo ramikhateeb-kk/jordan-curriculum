@@ -10,6 +10,7 @@ import datetime as dt
 import hashlib
 import io
 import re
+import time
 
 import pandas as pd
 import streamlit as st
@@ -225,20 +226,18 @@ def create_assignment(user, items, grade, track_id, replace_id=None, subject_id=
 
     md, plan = btec_ai.split_illustrations(md)
     folder = combined[:16]
-    gen, skipped = [], 0
+    gen, last_err = [], ""
     for ill in plan:
-        res = btec_ai.make_image(ill["prompt"])
-        if not res:
-            skipped += 1
-            md = md.replace(f"[[IMG:{ill['n']}]]", "")
-            continue
-        raw, mime = res
-        ext = "png" if "png" in mime else "jpg"
-        url = _put(f"btec/{folder}/gen{ill['n']}.{ext}", raw, mime, f"illustration{ill['n']}")
-        if url:
-            gen.append({"n": ill["n"], "url": url, "caption": ill["caption"]})
+        res, err = btec_ai.make_image(ill["prompt"])
+        if res:
+            raw, mime = res
+            url = _put(f"btec/{folder}/gen{ill['n']}.{'png' if 'png' in mime else 'jpg'}", raw, mime, f"illustration{ill['n']}")
         else:
-            md = md.replace(f"[[IMG:{ill['n']}]]", "")
+            url, last_err = "", err or last_err
+        # الصورة الفاشلة تبقى في القائمة بلا رابط (مع وصفها) ليمكن إعادة توليدها لاحقًا دون إعادة إنشاء الدليل
+        gen.append({"n": ill["n"], "url": url, "caption": ill["caption"], "prompt": ill["prompt"]})
+        time.sleep(3)   # تخفيف الضغط على حدّ المعدّل لنموذج الصور
+    skipped = sum(1 for g in gen if not g["url"])
     src_images, docs = store_sources(items, folder)
 
     row = {"guide_key": key, "grade": grade, "track_id": track_id, "title": default_title(data), "data": data,
@@ -254,7 +253,29 @@ def create_assignment(user, items, grade, track_id, replace_id=None, subject_id=
         saved = store.assignment(replace_id)
     else:
         saved = store.upsert("btec_assignments", [row], "guide_key")[0]
-    return {"status": "created", "assignment": saved, "images_skipped": skipped}
+    return {"status": "created", "assignment": saved, "images_skipped": skipped, "image_error": last_err}
+
+
+def regenerate_images(a):
+    """يعيد توليد الصور الناقصة فقط. يعيد (عدد ما نجح، آخر خطأ)."""
+    items = list(a.get("images") or [])
+    folder = hashlib.sha256((a.get("guide_key") or str(a["id"])).encode()).hexdigest()[:16]
+    done, last = 0, ""
+    for it in items:
+        if it.get("url") or not it.get("prompt"):
+            continue
+        res, err = btec_ai.make_image(it["prompt"])
+        if res:
+            raw, mime = res
+            url = _put(f"btec/{folder}/gen{it['n']}_{int(time.time())}.{'png' if 'png' in mime else 'jpg'}", raw, mime, f"illustration{it['n']}")
+            if url:
+                it["url"] = url
+                done += 1
+                continue
+        last = err or last
+        time.sleep(3)
+    store.update("btec_assignments", {"id": a["id"]}, {"images": items})
+    return done, last
 
 
 # ================================================================ عرض الدليل
@@ -283,7 +304,7 @@ def show_guide(a, staff=False):
         m = re.fullmatch(r"\[\[IMG:(\d+)\]\]", chunk)
         if m:
             img = by_n.get(int(m.group(1)))
-            if img:
+            if img and img.get("url"):
                 st.image(img["url"], caption=img.get("caption"), use_container_width=True)
         elif chunk.strip():
             rich_text.show(chunk, "rtl")
@@ -510,7 +531,8 @@ def _tab_upload(user, grade, track_id, subj="all"):
         else:
             st.success("✅ تم إنشاء الدليل وحفظه، وهو متاح الآن للطلاب.")
             if res.get("images_skipped"):
-                st.warning(f"تعذّر توليد {res['images_skipped']} من الصور التوضيحية (تحقق من اسم نموذج الصور GEMINI_IMAGE_MODEL).")
+                st.warning(f"تعذّر توليد {res['images_skipped']} من الصور التوضيحية. السبب: {res.get('image_error') or 'غير معروف'}\n\n"
+                           "يمكنك إعادة المحاولة من «📚 الواجبات» ← «⚙️ إدارة هذا الواجب» ← «🖼️ إعادة توليد الصور الناقصة».")
             show_guide(res["assignment"], staff=True)
 
 
@@ -536,6 +558,15 @@ def _tab_assignments(grade, track_id, is_sup, subj="all"):
                 store.update("btec_assignments", {"id": a["id"]}, {"title": title.strip() or a["title"], "published": pub, "subject_id": new_subj,
                                                                   "teacher_notes": new_notes.strip() or None})
                 st.rerun()
+            missing = [i for i in (a.get("images") or []) if not i.get("url") and i.get("prompt")]
+            if missing:
+                st.caption(f"صور توضيحية ناقصة: {len(missing)}")
+                if st.button("🖼️ إعادة توليد الصور الناقصة", key=f"btec_regen_{a['id']}"):
+                    with st.spinner("جارٍ توليد الصور..."):
+                        done, err = regenerate_images(a)
+                    (st.success if done else st.error)(f"تم توليد {done} من {len(missing)}." + (f" آخر خطأ: {err}" if err else ""))
+                    if done:
+                        st.rerun()
             sure = c2.checkbox("أؤكد الحذف النهائي (مع متابعة التقدم والفحوص)", key=f"btec_d_{a['id']}")
             if c2.button("🗑️ حذف الواجب", disabled=not sure, key=f"btec_del_{a['id']}"):
                 store.delete("btec_assignments", {"id": a["id"]})
