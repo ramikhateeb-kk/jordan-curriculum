@@ -144,12 +144,15 @@ if role == "admin":
         for _m, _st in _rag.model_status():
             st.write(f"{_m}: {_st}")
         st.caption(f"آخر نموذج أجاب: {_rag.LAST_USED[0] or '—'} — يُضاف نموذج بديل بمتغير GEMINI_FALLBACK_MODELS.")
-    admin_view = st.sidebar.radio("عرض المدير", ["📚 استخدام المنصة", "🎓 واجبات BTEC", "🎓 طاقم BTEC", "👑 إدارة الحسابات"])
+    admin_view = st.sidebar.radio("عرض المدير", ["📚 استخدام المنصة", "🎓 واجبات BTEC", "📘 مباحث BTEC", "🎓 طاقم BTEC", "👑 إدارة الحسابات"])
     if admin_view == "👑 إدارة الحسابات":
         auth_ui.render_admin_accounts_panel(user)
         st.stop()
     if admin_view == "🎓 واجبات BTEC":
         btec_assistant.render_staff(user, tracks)
+        st.stop()
+    if admin_view == "📘 مباحث BTEC":
+        btec_assistant.render_subjects_admin(tracks)
         st.stop()
     if admin_view == "🎓 طاقم BTEC":
         btec_assistant.render_staff_admin(tracks)
