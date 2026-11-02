@@ -6,10 +6,11 @@ btec_ai.py
 import json
 import os
 import re
+import time
 
 from google.genai import types
 
-from btec_prompt import (BTEC_DATA_PROMPT, BTEC_EVIDENCE_PROMPT, BTEC_FORMAT_ADDENDUM, BTEC_SYSTEM_PROMPT,
+from btec_prompt import (BTEC_DATA_PROMPT, BTEC_DIALECT_ADDENDUM, BTEC_EVIDENCE_PROMPT, BTEC_FORMAT_ADDENDUM, BTEC_SYSTEM_PROMPT,
                          BTEC_TEACHER_EXPLAIN_PROMPT, ILLUSTRATION_STYLE_SUFFIX)
 from config import GEMINI_MODEL
 from rag import get_client
@@ -51,8 +52,10 @@ def extract_data(items):
 
 def student_guide(items, data):
     ctx = "بيانات الواجب المستخرجة (للاسترشاد، والمرجع هو الملفات نفسها):\n" + json.dumps(data, ensure_ascii=False)
-    res = _gen(["حلّل الواجب المرفق وأعد الدليل الإرشادي المطلوب.", ctx] + parts(items),
-               system_instruction=BTEC_SYSTEM_PROMPT + BTEC_FORMAT_ADDENDUM, temperature=0.2)
+    ask = ("حلّل الواجب المرفق وأعد الدليل الإرشادي المطلوب. "
+           "تنبيه مهم: اكتب الشرح والتوجيه كله باللهجة الأردنية العامية البيضاء كما في تعليمات اللهجة، لا بالفصحى ولا بلهجة بلد آخر.")
+    res = _gen([ask, ctx] + parts(items),
+               system_instruction=BTEC_SYSTEM_PROMPT + BTEC_FORMAT_ADDENDUM + BTEC_DIALECT_ADDENDUM, temperature=0.3)
     return (res.text or "").strip()
 
 
@@ -69,20 +72,38 @@ def split_illustrations(md):
     return _IMG_RE.sub(repl, md), found
 
 
-def make_image(prompt):
-    """(bytes, mime) أو None عند الفشل. يستخدم العميل الخام لأن الانتقال بين نماذج النص لا يناسب نموذج الصور."""
-    try:
-        raw = get_client()._c
-        res = raw.models.generate_content(
-            model=IMAGE_MODEL, contents=[prompt + ILLUSTRATION_STYLE_SUFFIX],
-            config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]))
-        for cand in res.candidates or []:
-            for p in (cand.content.parts if cand.content else []) or []:
-                if getattr(p, "inline_data", None) and p.inline_data.data:
-                    return p.inline_data.data, (p.inline_data.mime_type or "image/png")
-    except Exception as e:  # noqa: BLE001
-        print("BTEC image generation failed:", str(e)[:200])
-    return None
+def _retry_delay(msg):
+    m = re.search(r"retry(?:Delay)?\D{0,12}(\d+(?:\.\d+)?)\s*s", msg, re.I)
+    return float(m.group(1)) if m else None
+
+
+def make_image(prompt, attempts=3):
+    """يعيد ((bytes, mime) أو None, رسالة_الخطأ). يعيد المحاولة عند حدّ المعدّل/الانشغال، ويستخدم العميل الخام
+    لأن الانتقال بين نماذج النص لا يناسب نموذج الصور."""
+    last = ""
+    for i in range(attempts):
+        try:
+            raw = get_client()._c
+            mods = ["IMAGE", "TEXT"] if i == 0 else ["IMAGE"]
+            res = raw.models.generate_content(
+                model=IMAGE_MODEL, contents=[prompt + ILLUSTRATION_STYLE_SUFFIX],
+                config=types.GenerateContentConfig(response_modalities=mods))
+            for cand in res.candidates or []:
+                for p in (cand.content.parts if cand.content else []) or []:
+                    if getattr(p, "inline_data", None) and p.inline_data.data:
+                        return (p.inline_data.data, (p.inline_data.mime_type or "image/png")), ""
+            last = "لم يُرجع النموذج صورة (ربما رفض الطلب أو أرجع نصًا فقط)."
+        except Exception as e:  # noqa: BLE001
+            last = str(e)[:300]
+            low = last.lower()
+            if any(k in low for k in ("404", "not found", "not supported", "permission", "api key", "invalid")) and \
+                    "429" not in low and "quota" not in low:
+                break   # خطأ في اسم النموذج/الصلاحية: لا فائدة من التكرار
+            time.sleep(min(_retry_delay(last) or 8 * (i + 1), 45))
+            continue
+        time.sleep(3)
+    print("BTEC image generation failed:", last)
+    return None, last
 
 
 def teacher_explain(data, guide_md, notes=None):
