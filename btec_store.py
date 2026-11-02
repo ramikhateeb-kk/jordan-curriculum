@@ -170,3 +170,24 @@ def subjects_for(track_id, active_only=True):
 def assignment(aid):
     rows = select("btec_assignments", {"id": aid})
     return rows[0] if rows else None
+
+
+# ---------------------------------------------------------------- مباحث BTEC في تسجيل المعلمين
+BTEC_PREFIX = "BTEC: "   # يُضاف لاسم المبحث في قائمة التسجيل ليتميّز عن مباحث الكتب
+
+
+def btec_subject_names():
+    """أسماء مباحث BTEC الفعّالة (بلا تكرار) لعرضها في نموذج تسجيل المعلم."""
+    return sorted({r["name"] for r in select("btec_subjects", {"active": True}, columns="name")})
+
+
+def btec_subject_pairs():
+    """{(track_id, name)} لكل مبحث BTEC فعّال."""
+    return {(r["track_id"], r["name"]) for r in select("btec_subjects", {"active": True}, columns="track_id,name")}
+
+
+def assign_teacher(user_id, track_ids):
+    """يعيّن المعلم «معلم BTEC» على هذه التخصصات/الصفوف دون المساس بدور المشرف إن كان معيّنًا فيها."""
+    have = {r["track_id"] for r in select("btec_staff", {"user_id": user_id})}
+    rows = [{"user_id": user_id, "track_id": t, "role": "teacher"} for t in track_ids if t not in have]
+    upsert("btec_staff", rows, "user_id,track_id")
