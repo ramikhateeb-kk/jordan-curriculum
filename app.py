@@ -8,6 +8,8 @@ from google.genai import types
 
 import accounts as acc
 import auth_ui
+import btec_assistant
+import btec_store
 import catalog
 import companion
 import explain_ctx
@@ -122,15 +124,35 @@ except Exception as e:  # noqa: BLE001
 user = auth_ui.require_login()
 role = user["role"]   # "student" | "teacher" | "supervisor" | "admin"
 
+# ---- طلاب BTEC (العاشر/الحادي عشر/الثاني عشر): تبويب «مساعد BTEC» فقط، بلا اشرح لي ولا قيّمني ولا غيرهما
+if btec_assistant.is_btec_student(user, tracks):
+    btec_assistant.render_student(user, tracks)
+    st.stop()
+
+# ---- طاقم BTEC (مشرف/معلم يعيّنه المدير): تبويبات الواجبات والمتابعة وفحص الأدلة
+if role in ("teacher", "supervisor") and btec_store.staff_rows(user["id"]):
+    _view = "🎓 BTEC"
+    if btec_assistant.has_general_scope(user, tracks):   # لديه أيضًا مباحث عامة → يختار القسم
+        _view = st.sidebar.radio("القسم", ["🎓 BTEC", "📚 المنهاج العام"])
+    if _view == "🎓 BTEC":
+        btec_assistant.render_staff(user, tracks)
+        st.stop()
+
 if role == "admin":
     with st.sidebar.expander("🤖 حالة نماذج الذكاء الاصطناعي"):
         import rag as _rag
         for _m, _st in _rag.model_status():
             st.write(f"{_m}: {_st}")
         st.caption(f"آخر نموذج أجاب: {_rag.LAST_USED[0] or '—'} — يُضاف نموذج بديل بمتغير GEMINI_FALLBACK_MODELS.")
-    admin_view = st.sidebar.radio("عرض المدير", ["📚 استخدام المنصة", "👑 إدارة الحسابات"])
+    admin_view = st.sidebar.radio("عرض المدير", ["📚 استخدام المنصة", "🎓 واجبات BTEC", "🎓 طاقم BTEC", "👑 إدارة الحسابات"])
     if admin_view == "👑 إدارة الحسابات":
         auth_ui.render_admin_accounts_panel(user)
+        st.stop()
+    if admin_view == "🎓 واجبات BTEC":
+        btec_assistant.render_staff(user, tracks)
+        st.stop()
+    if admin_view == "🎓 طاقم BTEC":
+        btec_assistant.render_staff_admin(tracks)
         st.stop()
 
 scope = acc.teacher_scope(user["id"]) if role in ("teacher", "supervisor") else []
