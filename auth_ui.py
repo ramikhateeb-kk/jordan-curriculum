@@ -8,6 +8,7 @@ import time
 import streamlit as st
 
 import accounts as acc
+import btec_store
 import catalog
 from hijri import hijri_school_year
 from config import GRADES
@@ -70,6 +71,11 @@ def _register_student_form():
 
 def _register_teacher_form():
     subjects = _all_subjects()
+    try:   # مباحث BTEC (معرَّفة من المدير بلا كتب) تظهر في القائمة نفسها بوسم BTEC
+        subjects = subjects + [btec_store.BTEC_PREFIX + n for n in btec_store.btec_subject_names()]
+        btec_pairs = btec_store.btec_subject_pairs()
+    except Exception:  # noqa: BLE001
+        btec_pairs = set()
     st.caption("اختر المباحث والصفوف التي تُدرّسها فعليًا فقط. سيراجع المدير طلبك قبل التفعيل، "
               "وقد يُطلب منك إثبات (مثل جدول حصصك) قبل الموافقة.")
     tracks = _all_tracks()
@@ -97,17 +103,26 @@ def _register_teacher_form():
         submitted = st.form_submit_button("إرسال طلب التسجيل", type="primary")
     if not submitted:
         return
-    pairs, missing_track = [], []
+    pairs, missing_track, btec_bad = [], [], set(s for s in chosen_subjects if s.startswith(btec_store.BTEC_PREFIX))
     for g in grades:
         g_tracks = [track_opts[k] for k in chosen_tracks if track_opts[k]["grade"] == g]
         if g in catalog.TRACK_GRADES and any(t["grade"] == g for t in tracks) and not g_tracks:
             missing_track.append(g)
         for s in chosen_subjects:
-            if g_tracks:
+            if s.startswith(btec_store.BTEC_PREFIX):   # مبحث BTEC: يصح فقط مع تخصص BTEC معرَّف له هذا المبحث
+                nm = s[len(btec_store.BTEC_PREFIX):]
+                ok = [t for t in g_tracks if (t["id"], nm) in btec_pairs]
+                if ok:
+                    btec_bad.discard(s)
+                pairs += [{"subject": s, "grade": g, "track_id": t["id"]} for t in ok]
+            elif g_tracks:
                 pairs += [{"subject": s, "grade": g, "track_id": t["id"]} for t in g_tracks]
             else:
                 pairs.append({"subject": s, "grade": g})
-    if missing_track:
+    if btec_bad:
+        st.error("مباحث BTEC التالية لا تطابق الصف/التخصص المختار (اختر تخصص BTEC الصحيح لها من قائمة التخصصات): "
+                 + "، ".join(sorted(btec_bad)))
+    elif missing_track:
         st.error("اختر تخصصًا واحدًا على الأقل لكل من: " + "، ".join(f"الصف {g}" for g in missing_track))
     elif not (name.strip() and phone.strip() and pw1):
         st.error("يرجى تعبئة الاسم ورقم الهاتف وكلمة المرور.")
@@ -282,7 +297,12 @@ def render_admin_accounts_panel(current_user):
                         if not kept:
                             st.error("يجب اعتماد مبحث واحد على الأقل، أو اختر رفض الطلب.")
                         else:
-                            acc.approve_teacher(u["id"], current_user["id"], kept, sub_end.isoformat(), trial=as_trial)
+                            # مباحث BTEC لا تُخزَّن في teacher_subjects؛ تتحول إلى تعيين «معلم BTEC» على تخصصها
+                            btec_kept = [p for p in kept if str(p["subject"]).startswith(btec_store.BTEC_PREFIX)]
+                            regular = [p for p in kept if p not in btec_kept]
+                            acc.approve_teacher(u["id"], current_user["id"], regular, sub_end.isoformat(), trial=as_trial)
+                            if btec_kept:
+                                btec_store.assign_teacher(u["id"], {p["track_id"] for p in btec_kept if p.get("track_id")})
                             st.rerun()
                     if c2.button("❌ رفض الطلب بالكامل", key=f"reject_{u['id']}"):
                         acc.reject_user(u["id"])
