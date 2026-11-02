@@ -148,11 +148,23 @@ def staff_rows(user_id):
     return select("btec_staff", {"user_id": user_id})
 
 
-def assignments_for(grade, track_id, published_only=False, columns="*"):
+def assignments_for(grade, track_id, published_only=False, columns="*", subject="all"):
+    """subject: "all" = كل المباحث، "none" = بلا مبحث، أو رقم مبحث."""
     f = {"grade": grade, "track_id": track_id}
     if published_only:
         f["published"] = True
+    if subject == "none":
+        f["subject_id"] = None
+    elif subject != "all":
+        f["subject_id"] = int(subject)
     return select("btec_assignments", f, columns=columns, order="id.desc")
+
+
+def subjects_for(track_id, active_only=True):
+    f = {"track_id": track_id}
+    if active_only:
+        f["active"] = True
+    return select("btec_subjects", f, order="sort_order.asc")
 
 
 def assignment(aid):
