@@ -437,6 +437,7 @@ def _student_eval(user, a):
     st.metric("المعايير المنجزة", f"{met} من {len(crit)}")
     if res.get("summary"):
         st.info(res["summary"])
+    _show_ai_usage(res, student=True)
     st.dataframe(pd.DataFrame([{"المعيار": c.get("code"), "الحالة": STUDENT_VERDICT.get(c.get("verdict"), "—"),
                                 "شو لقيت بشغلك": c.get("evidence_found", ""), "شو ناقص": c.get("missing", ""),
                                 "نصيحة": c.get("feedback", "")} for c in rows]), hide_index=True, use_container_width=True)
@@ -723,6 +724,53 @@ def _tab_teacher_explain(user, grade, track_id, subj="all"):
     rich_text.show(a["teacher_explain"], "rtl")
 
 
+BANDS = {"low": ("🟢", "منخفض"), "medium": ("🟡", "متوسط"), "high": ("🔴", "مرتفع"), "na": ("⚪", "غير قابل للتقدير")}
+CONF = {"low": "منخفضة", "medium": "متوسطة", "high": "عالية"}
+AI_NOTE_TEACHER = ("تقدير تقريبي من نموذج لغوي وليس أداة كشف مثبتة؛ قد يخطئ، خصوصًا مع الكتابة الرسمية أو التقنية أو لغير الناطقين بالعربية/الإنجليزية، "
+                   "ولا يصلح وحده دليلًا على مخالفة. استخدمه لفتح حوار مع الطالب (مناقشته في عمله وخطوات إنجازه) وللتحقق من أثر العملية.")
+AI_NOTE_STUDENT = ("هاد مؤشر تقريبي وممكن يغلط، ومش حكم عليك. المهم تكتب بأسلوبك وبمعلومات من مشروعك، "
+                   "وتوثّق خطوات شغلك بصور وقياسات من تنفيذك إنت.")
+
+
+def _ai_info(res):
+    """(كائن ai_usage, النسبة المقرّبة أو None, الفئة low|medium|high|na) — الفئة تُشتق من النسبة لتفادي التناقض."""
+    u = res.get("ai_usage") or {}
+    try:
+        pct = max(0, min(100, round(float(u.get("estimated_percent")))))
+    except (TypeError, ValueError):
+        pct = None
+    if u.get("level") == "not_assessable" or pct is None:
+        return u, None, "na"
+    return u, pct, ("low" if pct < 25 else "medium" if pct <= 60 else "high")
+
+
+def _show_ai_usage(res, student=False):
+    if not res.get("ai_usage"):
+        return
+    u, pct, band = _ai_info(res)
+    emoji, label = BANDS[band]
+    st.markdown("##### 🤖 مؤشر استخدام الذكاء الاصطناعي")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("النسبة التقديرية", f"{pct}%" if pct is not None else "—")
+    c2.metric("المستوى", f"{emoji} {label}")
+    c3.metric("الثقة بالتقدير", CONF.get(u.get("confidence"), "—"))
+    if band == "na":
+        st.caption("لا يمكن تقدير ذلك لهذا الملف (نص قليل أو الشغل صور/رسومات). " + (u.get("limitations") or ""))
+    else:
+        if u.get("indicators"):
+            with st.expander("ما الذي بنى عليه التقدير؟"):
+                st.markdown("**مؤشرات ترجّح الكتابة بالذكاء الاصطناعي:**")
+                for x in u["indicators"]:
+                    st.markdown(f"- {x}")
+                if u.get("human_signals"):
+                    st.markdown("**ما يرجّح أنه من عمل الطالب:**")
+                    for x in u["human_signals"]:
+                        st.markdown(f"- {x}")
+                if u.get("limitations"):
+                    st.caption(u["limitations"])
+    st.caption("⚠️ " + (AI_NOTE_STUDENT if student else AI_NOTE_TEACHER))
+
+
 def _rtl(par):
     from docx.oxml import OxmlElement
     pPr = par._p.get_or_add_pPr()
@@ -746,6 +794,14 @@ def _report_docx(rep):
     if res.get("summary"):
         _rtl(doc.add_heading("الملخص", level=2))
         _rtl(doc.add_paragraph(res["summary"]))
+    if res.get("ai_usage"):
+        u, pct, band = _ai_info(res)
+        _rtl(doc.add_heading("مؤشر استخدام الذكاء الاصطناعي", level=2))
+        _rtl(doc.add_paragraph(f"النسبة التقديرية: {str(pct) + '%' if pct is not None else 'غير قابلة للتقدير'} — المستوى: {BANDS[band][1]} — "
+                               f"الثقة: {CONF.get(u.get('confidence'), '—')}"))
+        for x in u.get("indicators") or []:
+            _rtl(doc.add_paragraph(str(x), style="List Bullet"))
+        _rtl(doc.add_paragraph("تنبيه: " + AI_NOTE_TEACHER))
     tbl = doc.add_table(rows=1, cols=5)
     tbl.style = "Table Grid"
     tbl._tbl.tblPr.append(OxmlElement("w:bidiVisual"))
@@ -783,6 +839,7 @@ def _show_report(rep):
         st.metric("المعايير المحقَّقة", f"{met} من {len(crit)}")
     if res.get("summary"):
         st.info(res["summary"])
+    _show_ai_usage(res)
     st.dataframe(pd.DataFrame([{"المعيار": c.get("code"), "النتيجة": VERDICT.get(c.get("verdict"), ("—", None))[0],
                                 "ما وُجد": c.get("evidence_found", ""), "الناقص": c.get("missing", ""),
                                 "ملاحظة للطالب": c.get("feedback", "")} for c in crit]),
