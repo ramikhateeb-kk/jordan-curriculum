@@ -10,7 +10,7 @@ import time
 
 from google.genai import types
 
-from btec_prompt import (BTEC_DATA_PROMPT, BTEC_DIALECT_ADDENDUM, BTEC_EVIDENCE_PROMPT, BTEC_FORMAT_ADDENDUM, BTEC_SYSTEM_PROMPT,
+from btec_prompt import (BTEC_DATA_PROMPT, BTEC_DIALECT_ADDENDUM, BTEC_STUDENT_EVAL_PROMPT, BTEC_EVIDENCE_PROMPT, BTEC_FORMAT_ADDENDUM, BTEC_SYSTEM_PROMPT,
                          BTEC_TEACHER_EXPLAIN_PROMPT, ILLUSTRATION_STYLE_SUFFIX)
 from config import GEMINI_MODEL
 from rag import get_client
@@ -121,3 +121,11 @@ def review_evidence(data, items, student_name="", notes=None):
     d = _json(_gen([head] + parts(items), system_instruction=BTEC_EVIDENCE_PROMPT, temperature=0,
                    response_mime_type="application/json").text)
     return d
+
+
+def evaluate_for_student(data, items, notes=None):
+    """تقييم استرشادي لشغل الطالب مقابل معايير واجبه (بلهجة أردنية). لا يُحفظ شيء."""
+    head = ("بيانات الواجب ومعاييره (JSON):\n" + json.dumps(data, ensure_ascii=False) +
+            (f"\n\nملاحظات المشرف المهمة على الواجب (راعها):\n{notes}" if notes else "") + "\n\nشغل الطالب المرفق:")
+    return _json(_gen([head] + parts(items), system_instruction=BTEC_STUDENT_EVAL_PROMPT + BTEC_DIALECT_ADDENDUM,
+                      temperature=0, response_mime_type="application/json").text)
