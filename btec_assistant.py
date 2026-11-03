@@ -32,6 +32,10 @@ AUDIO_MIME = {"mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4", "ogg"
 LOCAL_FILES = BASE / "data" / "btec_files"
 IMG_MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+CAD_MIME = {
+    "dwg": "application/acad",
+    "dxf": "application/dxf"
+}
 _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 VERDICT = {"met": ("✅ محقَّق", "محقَّق"), "partial": ("🟡 جزئي", "قيد التنفيذ"),
            "not_met": ("❌ غير محقَّق", "غير محقَّق"), "not_assessable": ("⚪ غير قابل للحكم", None)}
