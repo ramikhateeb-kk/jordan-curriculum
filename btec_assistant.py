@@ -31,7 +31,6 @@ LOCAL_FILES = BASE / "data" / "btec_files"
 IMG_MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-STATUSES = ["لم يبدأ", "قيد التنفيذ", "سُلِّم", "محقَّق", "غير محقَّق", "يحتاج إعادة"]
 VERDICT = {"met": ("✅ محقَّق", "محقَّق"), "partial": ("🟡 جزئي", "قيد التنفيذ"),
            "not_met": ("❌ غير محقَّق", "غير محقَّق"), "not_assessable": ("⚪ غير قابل للحكم", None)}
 
@@ -388,17 +387,6 @@ def render_student(user, tracks):
     a = store.assignment(pick)
     show_guide(a)
 
-    crit = _criteria(a)
-    prog = {p["criterion"]: p for p in store.select("btec_progress", {"assignment_id": pick, "student_id": user["id"]})}
-    if crit and prog:
-        with st.expander("📈 تقدّمي في معايير هذا الواجب"):
-            st.dataframe(pd.DataFrame([{"المعيار": c["code"], "الحالة": prog.get(c["code"], {}).get("status", "لم يبدأ")}
-                                       for c in crit]), hide_index=True, use_container_width=True)
-            note = (prog.get("_note") or {}).get("note")
-            if note:
-                st.info(f"ملاحظة المعلم: {note}")
-
-
 # ================================================================ طاقم BTEC (واجهة المدير)
 def render_staff_admin(tracks):
     st.subheader("🎓 إدارة طاقم BTEC")
@@ -438,15 +426,6 @@ def render_staff_admin(tracks):
 
 
 # ================================================================ واجهة المشرف / المعلم / المدير
-def _students(grade, track_id):
-    out = [u for u in acc.list_users(role="student") if u["status"] == "active" and u.get("grade") == grade
-           and u.get("track_id") == track_id]
-    names = {}
-    for u in out:   # تمييز الأسماء المكررة
-        names[u["id"]] = u["name"] if sum(1 for x in out if x["name"] == u["name"]) == 1 else f"{u['name']} (#{u['id']})"
-    return names
-
-
 def _pick_assignment(grade, track_id, key, published_only=False, subj="all"):
     rows = store.assignments_for(grade, track_id, published_only=published_only, columns="id,title,published", subject=subj)
     if not rows:
@@ -473,7 +452,7 @@ def render_staff(user, tracks):
 
     subj = _subject_picker(sel, key=f"btec_staff_subj_{sel}", grade=grade, allow_all=True)
 
-    names = (["📤 رفع واجب"] if is_sup else []) + ["📚 الواجبات", "🧑‍🏫 دليل شرح الواجب", "📈 متابعة التقدم", "🔎 فحص الأدلة"]
+    names = (["📤 رفع واجب"] if is_sup else []) + ["📚 الواجبات", "🧑‍🏫 دليل شرح الواجب", "🔎 فحص الأدلة"]
     tabs = dict(zip(names, st.tabs(names)))
 
     if is_sup:
@@ -483,8 +462,6 @@ def render_staff(user, tracks):
         _tab_assignments(grade, sel, is_sup, subj)
     with tabs["🧑‍🏫 دليل شرح الواجب"]:
         _tab_teacher_explain(user, grade, sel, subj)
-    with tabs["📈 متابعة التقدم"]:
-        _tab_progress(user, grade, sel, subj)
     with tabs["🔎 فحص الأدلة"]:
         _tab_evidence(user, grade, sel, subj)
 
@@ -536,6 +513,90 @@ def _tab_upload(user, grade, track_id, subj="all"):
             show_guide(res["assignment"], staff=True)
 
 
+def _headings(md):
+    """[(رقم السطر, نص العنوان)] لعناوين Markdown في الدليل."""
+    return [(n, ln.lstrip("# ").strip()) for n, ln in enumerate(md.split("\n")) if re.match(r"^#{1,3}\s", ln)]
+
+
+def _insert_marker(md, n, where):
+    """يضيف [[IMG:n]] في نهاية الدليل (where=None) أو بداية الدليل ("top") أو بعد سطر عنوان محدد (رقم السطر)."""
+    mk = f"\n[[IMG:{n}]]\n"
+    lines = md.split("\n")
+    if where is None:
+        return md.rstrip() + "\n" + mk
+    if where == "top":
+        return mk.lstrip() + "\n" + md
+    lines.insert(int(where) + 1, mk)
+    return "\n".join(lines)
+
+
+def _edit_guide(a):
+    """تحرير نص دليل الطالب المحفوظ وإدارة صوره (مشرف BTEC/المدير)."""
+    aid = a["id"]
+    tkey = f"btec_ed_txt_{aid}"
+    pend = st.session_state.pop(f"btec_ed_pending_{aid}", None)
+    if pend is not None:                 # نتيجة عملية على الصور: نحدّث النص الظاهر قبل إنشاء الحقل
+        st.session_state[tkey] = pend
+    elif tkey not in st.session_state:
+        st.session_state[tkey] = a["student_guide"]
+    st.caption("عدّل النص كما تريد (Markdown). العلامة `[[IMG:رقم]]` هي مكان الصورة في الدليل؛ احتفظ بها إن أردت بقاء الصورة، وانقلها لتغيير مكانها.")
+    md = st.text_area("نص دليل الطالب", height=480, key=tkey)
+    images = [dict(i) for i in (a.get("images") or [])]
+
+    st.markdown("**🖼️ صور الدليل**")
+    for im in images:
+        c1, c2, c3 = st.columns([2, 4, 1])
+        if im.get("url"):
+            c1.image(im["url"], use_container_width=True)
+        else:
+            c1.caption("⚠️ ناقصة")
+        im["caption"] = c2.text_input(f"التعليق — صورة {im['n']}  (`[[IMG:{im['n']}]]`)", value=im.get("caption") or "",
+                                      key=f"btec_cap_{aid}_{im['n']}")
+        if c3.button("🗑️", key=f"btec_imdel_{aid}_{im['n']}", help="حذف الصورة من الدليل"):
+            rest = [i for i in images if i["n"] != im["n"]]
+            new_md = re.sub(rf"\n?\[\[IMG:{im['n']}\]\]\n?", "\n", md)
+            store.update("btec_assignments", {"id": aid}, {"student_guide": new_md, "images": rest,
+                                                           "updated_at": dt.datetime.utcnow().isoformat()})
+            st.session_state[f"btec_ed_pending_{aid}"] = new_md
+            st.rerun()
+
+    with st.expander("➕ إضافة صورة إلى الدليل"):
+        up = st.file_uploader("الصورة", type=["png", "jpg", "jpeg", "webp"], key=f"btec_imup_{aid}")
+        cap = st.text_input("تعليق الصورة (اختياري)", key=f"btec_imcap_{aid}")
+        heads = _headings(md)
+        opts = [None, "top"] + [h[0] for h in heads]
+        lab = {None: "في نهاية الدليل", "top": "في بداية الدليل", **{h[0]: f"بعد العنوان: {h[1]}" for h in heads}}
+        where = st.selectbox("مكان الصورة", opts, format_func=lambda v: lab[v], key=f"btec_imwhere_{aid}")
+        if st.button("➕ إضافة", key=f"btec_imadd_{aid}", disabled=up is None):
+            try:
+                data, mime = imgs.prepare(Image.open(io.BytesIO(up.getvalue())))
+            except Exception as e:  # noqa: BLE001
+                st.error(f"تعذّرت قراءة الصورة: {e}")
+                return
+            n = max([i["n"] for i in images] or [0]) + 1
+            folder = hashlib.sha256((a.get("guide_key") or str(aid)).encode()).hexdigest()[:16]
+            url = _put(f"btec/{folder}/add{n}_{int(time.time())}.{'png' if mime == 'image/png' else 'jpg'}", data, mime, f"image{n}")
+            if not url:
+                st.error("تعذّر رفع الصورة إلى التخزين.")
+                return
+            images.append({"n": n, "url": url, "caption": cap.strip(), "prompt": ""})
+            new_md = _insert_marker(md, n, where)
+            store.update("btec_assignments", {"id": aid}, {"student_guide": new_md, "images": images,
+                                                           "updated_at": dt.datetime.utcnow().isoformat()})
+            st.session_state[f"btec_ed_pending_{aid}"] = new_md
+            st.rerun()
+        st.caption("تُحفظ تعديلات النص الحالية مع إضافة الصورة أو حذفها.")
+
+    c1, c2 = st.columns(2)
+    if c1.button("💾 حفظ التعديلات", type="primary", key=f"btec_edsave_{aid}"):
+        store.update("btec_assignments", {"id": aid}, {"student_guide": md, "images": images,
+                                                       "updated_at": dt.datetime.utcnow().isoformat()})
+        st.success("تم حفظ الدليل. سيراه الطلاب بهذا الشكل.")
+        st.rerun()
+    if c2.checkbox("معاينة", key=f"btec_edprev_{aid}"):
+        show_guide({**a, "student_guide": md, "images": images})
+
+
 def _tab_assignments(grade, track_id, is_sup, subj="all"):
     a = _pick_assignment(grade, track_id, "btec_view_pick", subj=subj)
     if not a:
@@ -571,6 +632,9 @@ def _tab_assignments(grade, track_id, is_sup, subj="all"):
             if c2.button("🗑️ حذف الواجب", disabled=not sure, key=f"btec_del_{a['id']}"):
                 store.delete("btec_assignments", {"id": a["id"]})
                 st.rerun()
+    if is_sup:
+        with st.expander("✏️ تعديل دليل الطالب وصوره"):
+            _edit_guide(a)
     show_guide(a, staff=True)
 
 
@@ -593,58 +657,6 @@ def _tab_teacher_explain(user, grade, track_id, subj="all"):
                 st.rerun()
         return
     rich_text.show(a["teacher_explain"], "rtl")
-
-
-def _tab_progress(user, grade, track_id, subj="all"):
-    a = _pick_assignment(grade, track_id, "btec_prog_pick", subj=subj)
-    if not a:
-        return
-    crit = _criteria(a)
-    students = _students(grade, track_id)
-    if not crit:
-        st.info("لم تُستخرج معايير لهذا الواجب.")
-        return
-    if not students:
-        st.info("لا يوجد طلاب فعّالون في هذا الصف/التخصص بعد.")
-        return
-    codes = [c["code"] for c in crit]
-    saved = {(p["student_id"], p["criterion"]): p for p in store.select("btec_progress", {"assignment_id": a["id"]})}
-
-    with st.expander("📋 المعايير"):
-        st.dataframe(pd.DataFrame([{"الرمز": c["code"], "المستوى": c.get("level", ""), "النص": c.get("text", "")} for c in crit]),
-                     hide_index=True, use_container_width=True)
-
-    # ملخص الاستيفاء
-    summ = []
-    for sid, nm in students.items():
-        done = sum(1 for c in codes if saved.get((sid, c), {}).get("status") == "محقَّق")
-        summ.append({"الطالب": nm, "المحقَّق": f"{done}/{len(codes)}", "النسبة %": round(100 * done / len(codes))})
-    st.markdown("**ملخص استيفاء المعايير**")
-    st.dataframe(pd.DataFrame(summ), hide_index=True, use_container_width=True)
-
-    st.markdown("**تحديث الحالات**")
-    df = pd.DataFrame([{"الطالب": nm, **{c: saved.get((sid, c), {}).get("status", "لم يبدأ") for c in codes},
-                        "ملاحظة": saved.get((sid, "_note"), {}).get("note") or ""} for sid, nm in students.items()])
-    cfg = {c: st.column_config.SelectboxColumn(c, options=STATUSES, required=True) for c in codes}
-    edited = st.data_editor(df, column_config=cfg, hide_index=True, disabled=["الطالب"], use_container_width=True,
-                            key=f"btec_ed_{a['id']}")
-    c1, c2 = st.columns(2)
-    if c1.button("💾 حفظ المتابعة", type="primary", key=f"btec_save_prog_{a['id']}"):
-        by_name = {v: k for k, v in students.items()}
-        out = []
-        for _, r in edited.iterrows():
-            sid = by_name[r["الطالب"]]
-            for c in codes:
-                out.append({"assignment_id": a["id"], "student_id": sid, "criterion": c, "status": r[c], "updated_by": user["id"]})
-            note = str(r["ملاحظة"] or "").strip()
-            if note or (sid, "_note") in saved:
-                out.append({"assignment_id": a["id"], "student_id": sid, "criterion": "_note", "status": "—",
-                            "note": note, "updated_by": user["id"]})
-        store.upsert("btec_progress", out, "assignment_id,student_id,criterion")
-        st.success("تم حفظ المتابعة.")
-        st.rerun()
-    c2.download_button("⬇️ تنزيل CSV", edited.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"btec_progress_{a['id']}.csv", mime="text/csv", key=f"btec_csv_{a['id']}")
 
 
 def _rtl(par):
@@ -717,58 +729,53 @@ def _show_report(rep):
 
 
 def _tab_evidence(user, grade, track_id, subj="all"):
-    st.caption("ارفع ملف الطالب الذي سلّمه (صور/PDF/Word) وسيفحصه النظام مقابل معايير الواجب ويُعدّ تقريرًا. "
-               "لا يلزم أن يكون الطالب مسجَّلًا في النظام. لا تُحفظ ملفات الطالب، يُحفظ التقرير فقط. "
+    st.caption("ارفع ملف الواجب الذي سلّمه الطالب (صور/PDF/Word). سيتعرّف النظام على الواجب ويفحص الأدلة مقابل معاييره ويُعدّ تقريرًا. "
+               "لا يلزم أن يكون الطالب مسجَّلًا، ولا يُحفظ شيء في النظام: نزّل التقرير إن أردت الاحتفاظ به. "
                "يُحتسب طلب واحد من حصتك اليومية.")
-    mode = st.radio("ورقة الواجب", ["من الواجبات المخزَّنة في النظام", "أرفع ورقة الواجب الآن"], horizontal=True,
-                    key="btec_ev_mode")
-    a, sheet = None, None
-    if mode.startswith("من"):
-        a = _pick_assignment(grade, track_id, "btec_ev_pick", subj=subj)
-        if a and not _criteria(a):
-            st.warning("لم تُستخرج معايير لهذا الواجب، لذا لا يمكن فحص الأدلة مقابله. ارفع ورقة الواجب بدلًا من ذلك.")
-    else:
-        sheet = st.file_uploader("ورقة الواجب (صور/PDF/Word)", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"],
-                                 accept_multiple_files=True, key="btec_ev_sheet")
-    label = st.text_input("اسم الطالب أو وصف التسليم (اختياري — يظهر في التقرير)", key="btec_ev_label")
-    ups = st.file_uploader("ملف الطالب المسلَّم (الأدلة)", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"],
+    ups = st.file_uploader("ملف الواجب المسلَّم", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"],
                            accept_multiple_files=True, key="btec_ev_up")
+    label = st.text_input("اسم الطالب (اختياري — يظهر في التقرير)", key="btec_ev_label")
+    manual = None
+    if st.session_state.get("btec_ev_need_manual"):
+        st.warning("لم أتمكن من تحديد الواجب ومعاييره من الملف المرفوع. اختر الواجب من القائمة ثم اضغط «افحص» مرة أخرى.")
+        manual = _pick_assignment(grade, track_id, "btec_ev_pick", subj="all")
 
-    if st.button("🔎 افحص الأدلة", type="primary", key="btec_ev_run"):
+    if st.button("🔎 افحص الواجب", type="primary", key="btec_ev_run"):
         items, err = read_uploads(ups)
-        sheet_items = None
-        if not err and a is None:
-            sheet_items, err = read_uploads(sheet)
-            err = ("ورقة الواجب: " + err) if err else None
-        if not err and a is not None and not _criteria(a):
-            err = "لا يمكن الفحص: لا معايير مخزَّنة لهذا الواجب."
         if err:
             st.error(err)
         else:
             auth_ui.require_quota_or_stop(user)
-            with st.spinner("جارٍ فحص الأدلة مقابل المعايير..."):
+            need_manual, res, alabel = False, None, ""
+            with st.spinner("جارٍ تحديد الواجب وفحص الأدلة مقابل المعايير..."):
                 try:
-                    if a is not None:
-                        data, notes, alabel = a["data"], a.get("teacher_notes"), a["title"]
+                    data = notes = None
+                    if manual and _criteria(manual):
+                        data, notes, alabel = manual["data"], manual.get("teacher_notes"), manual["title"]
                     else:
-                        data = btec_ai.extract_data(sheet_items)
-                        notes, alabel = None, default_title(data)
-                    if not data.get("readable", True) or not data.get("criteria"):
-                        st.error("تعذّرت قراءة معايير الواجب من الملف المرفوع. ارفع نسخة أوضح من ورقة الواجب.")
-                        res = None
-                    else:
+                        sub = btec_ai.extract_data(items)
+                        if not sub.get("readable", False):
+                            st.error((sub.get("reason") or "الملف غير واضح") + " — ارفع نسخة أوضح.")
+                        else:
+                            cand = next((c for c in store.assignments_for(grade, track_id)
+                                         if _same(sub, c.get("data") or {}) and _criteria(c)), None)
+                            if cand:
+                                data, notes, alabel = cand["data"], cand.get("teacher_notes"), cand["title"]
+                            elif sub.get("criteria"):
+                                data, alabel = sub, default_title(sub)
+                            else:
+                                need_manual = True
+                    if data:
                         res = btec_ai.review_evidence(data, items, label.strip(), notes)
                 except Exception as e:  # noqa: BLE001
-                    res = None
                     st.error(f"حدث خطأ: {e}")
+            if need_manual:
+                st.session_state["btec_ev_need_manual"] = True
+                st.rerun()
             if res and res.get("criteria"):
-                rep = {"assignment_label": alabel, "student_label": label.strip(), "result": res,
-                       "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
-                store.insert("btec_reviews", {"assignment_id": a["id"] if a else None, "student_label": rep["student_label"],
-                                              "assignment_label": alabel, "result": res,
-                                              "file_names": [i["name"] for i in items], "reviewed_by": user["id"],
-                                              "created_at": dt.datetime.utcnow().isoformat()})
-                st.session_state["btec_ev_report"] = rep
+                st.session_state.pop("btec_ev_need_manual", None)
+                st.session_state["btec_ev_report"] = {"assignment_label": alabel, "student_label": label.strip(), "result": res,
+                                                      "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
             elif res is not None:
                 st.error("تعذّر فهم نتيجة الفحص. حاول مرة أخرى.")
 
@@ -776,13 +783,3 @@ def _tab_evidence(user, grade, track_id, subj="all"):
     if rep:
         st.divider()
         _show_report(rep)
-
-    hist = store.select("btec_reviews", {"reviewed_by": user["id"]}, order="created_at.desc", limit=10)
-    if hist:
-        with st.expander("🕘 آخر تقاريري المحفوظة"):
-            idx = st.selectbox("اختر تقريرًا", range(len(hist)), key="btec_ev_hist", format_func=lambda i: (
-                f"{hist[i].get('assignment_label') or 'واجب'} — {hist[i].get('student_label') or 'بدون اسم'} — "
-                f"{str(hist[i].get('created_at') or '')[:16].replace('T', ' ')}"))
-            h = hist[idx]
-            _show_report({"assignment_label": h.get("assignment_label") or "واجب", "student_label": h.get("student_label") or "",
-                          "result": h["result"], "date": str(h.get("created_at") or "")[:16].replace("T", " ")})
