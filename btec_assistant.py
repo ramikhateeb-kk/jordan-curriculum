@@ -26,7 +26,9 @@ import images as imgs
 import rich_text
 from config import BASE, GRADES
 
-MAX_FILES, MAX_FILE_MB, MAX_TOTAL_MB, MAX_PDF_PAGES = 10, 10, 18, 20
+MAX_FILES, MAX_FILE_MB, MAX_TOTAL_MB = 10, 10, 18
+MAX_AUDIO_MB = 25
+AUDIO_MIME = {"mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4", "ogg": "audio/ogg"}
 LOCAL_FILES = BASE / "data" / "btec_files"
 IMG_MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -88,20 +90,6 @@ def _docx_text(data):
     return "\n".join(out)
 
 
-def _pdf_pages_png(data):
-    try:
-        import fitz
-    except ImportError:
-        return []
-    pages = []
-    with fitz.open(stream=data, filetype="pdf") as pdf:
-        for i, page in enumerate(pdf):
-            if i >= MAX_PDF_PAGES:
-                break
-            pages.append(page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4)).tobytes("png"))
-    return pages
-
-
 def read_uploads(files):
     """[UploadedFile] → (ملفات مجهَّزة, رسالة خطأ أو None)."""
     if not files:
@@ -121,11 +109,11 @@ def read_uploads(files):
                 Image.open(io.BytesIO(data)).verify()
                 item.update(kind="image", mime=IMG_MIME[ext], pages=[data])
             elif ext == "pdf":
-                item.update(kind="pdf", mime="application/pdf", pages=_pdf_pages_png(data))
+                return [], f"ملفات PDF غير مقبولة («{f.name}»). حوّل الصفحات إلى صور أو استخدم ملف Word (docx)."
             elif ext == "docx":
                 item.update(kind="docx", mime=DOCX_MIME, text=_docx_text(data))
             else:
-                return [], f"نوع الملف «{f.name}» غير مدعوم. المسموح: صور، PDF، Word (docx)."
+                return [], f"نوع الملف «{f.name}» غير مدعوم. المسموح: صور (png/jpg/webp) أو Word (docx)."
         except Exception as e:  # noqa: BLE001
             return [], f"تعذّرت قراءة الملف «{f.name}»: {e}"
         out.append(item)
@@ -160,7 +148,7 @@ def store_sources(items, folder):
                 continue
             images.append(_put(f"btec/{folder}/src{n:02d}.{'png' if mime == 'image/png' else 'jpg'}", data, mime, f"page{n}"))
         if it["kind"] != "image":
-            ext = "pdf" if it["kind"] == "pdf" else "docx"
+            ext = "docx"
             docs.append({"name": it["name"], "url": _put(f"btec/{folder}/{it['sha'][:12]}.{ext}", it["data"],
                                                          it["mime"], it["name"], public_image=False)})
     return [u for u in images if u], docs
@@ -203,7 +191,7 @@ def create_assignment(user, items, grade, track_id, replace_id=None, subject_id=
     data = btec_ai.extract_data(items)
     if not data.get("readable", False):
         return {"status": "unreadable", "message": (data.get("reason") or "الملفات غير واضحة أو لا تحوي واجب BTEC.")
-                + " يرجى رفع نسخة أوضح (صورة أقرب وبإضاءة جيدة، أو ملف PDF/Word الأصلي)."}
+                + " يرجى رفع نسخة أوضح (صورة أقرب وبإضاءة جيدة، أو ملف Word الأصلي)."}
 
     combined = hashlib.sha256("|".join(sorted(it["sha"] for it in items)).encode()).hexdigest()
     key = guide_key(data, grade, track_id, combined)
@@ -277,6 +265,96 @@ def regenerate_images(a):
     return done, last
 
 
+# ================================================================ وسائط الشرح: فيديو يوتيوب وملفات صوتية
+_YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def parse_youtube(url):
+    """معرّف فيديو يوتيوب من رابط watch / youtu.be / embed / shorts / live؛ None إن لم يكن رابطًا صالحًا."""
+    url = (url or "").strip()
+    m = re.match(r"^(?:https?://)?(?:www\.|m\.)?(?:youtube\.com|youtube-nocookie\.com)/(?:watch\?(?:.*&)?v=|embed/|shorts/|live/)([A-Za-z0-9_-]{11})", url) \
+        or re.match(r"^(?:https?://)?youtu\.be/([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m and _YT_ID.match(m.group(1)) else None
+
+
+def _render_media_item(m, staff=False):
+    title = m.get("title") or ("فيديو" if m.get("kind") == "youtube" else "ملف صوتي")
+    st.markdown(f"**{'🎬' if m.get('kind') == 'youtube' else '🎧'} {title}**" +
+                ("  ·  🔒 للمعلمين فقط" if staff and not m.get("student_visible", True) else ""))
+    if m.get("kind") == "youtube":
+        st.video(f"https://www.youtube.com/watch?v={m['id']}")
+    elif m.get("url"):
+        st.audio(m["url"])
+
+
+def _show_media(a, staff=False):
+    """عرض وسائط الشرح: الطالب يرى ما عُلِّم «يظهر للطلاب» فقط، والطاقم يرى الكل."""
+    items = [m for m in (a.get("media") or []) if staff or m.get("student_visible", True)]
+    if not items:
+        return
+    st.markdown("#### 🎬 شرح الواجب: فيديو وصوت")
+    for m in items:
+        _render_media_item(m, staff=staff)
+
+
+def _media_manager(a):
+    """إضافة/حذف وسائط الشرح (طاقم BTEC)."""
+    aid = a["id"]
+    media = [dict(m) for m in (a.get("media") or [])]
+    st.markdown("#### 🎬 فيديو وصوت لشرح الواجب")
+    if not media:
+        st.caption("لا توجد وسائط بعد. أضف رابط يوتيوب أو ملفًا صوتيًا.")
+    for k, m in enumerate(media):
+        with st.container(border=True):
+            _render_media_item(m)
+            c1, c2 = st.columns([3, 1])
+            vis = c1.checkbox("يظهر للطلاب", value=m.get("student_visible", True), key=f"btec_mvis_{aid}_{m['id_key']}")
+            if vis != m.get("student_visible", True):
+                m["student_visible"] = vis
+                store.update("btec_assignments", {"id": aid}, {"media": media})
+                st.rerun()
+            if c2.button("🗑️ حذف", key=f"btec_mdel_{aid}_{m['id_key']}"):
+                store.update("btec_assignments", {"id": aid}, {"media": [x for x in media if x["id_key"] != m["id_key"]]})
+                st.rerun()
+
+    t_yt, t_au = st.tabs(["➕ فيديو يوتيوب", "➕ ملف صوتي"])
+    with t_yt:
+        url = st.text_input("رابط الفيديو", key=f"btec_yt_url_{aid}", placeholder="https://www.youtube.com/watch?v=...")
+        title = st.text_input("العنوان (اختياري)", key=f"btec_yt_title_{aid}")
+        vis = st.checkbox("يظهر للطلاب", value=True, key=f"btec_yt_vis_{aid}")
+        if st.button("➕ إضافة الفيديو", key=f"btec_yt_add_{aid}"):
+            vid = parse_youtube(url)
+            if not vid:
+                st.error("الرابط غير صالح. استخدم رابط فيديو يوتيوب (watch أو youtu.be أو embed أو shorts).")
+            else:
+                media.append({"id_key": f"{int(time.time() * 1000)}", "kind": "youtube", "id": vid, "title": title.strip(),
+                              "student_visible": vis})
+                store.update("btec_assignments", {"id": aid}, {"media": media})
+                st.rerun()
+    with t_au:
+        up = st.file_uploader("الملف الصوتي (mp3 / m4a / wav / ogg)", type=list(AUDIO_MIME), key=f"btec_au_up_{aid}")
+        title = st.text_input("العنوان (اختياري)", key=f"btec_au_title_{aid}")
+        vis = st.checkbox("يظهر للطلاب", value=True, key=f"btec_au_vis_{aid}")
+        if st.button("➕ إضافة الملف الصوتي", key=f"btec_au_add_{aid}", disabled=up is None):
+            data = up.getvalue()
+            ext = up.name.rsplit(".", 1)[-1].lower()
+            if len(data) > MAX_AUDIO_MB * 1024 * 1024:
+                st.error(f"الملف أكبر من {MAX_AUDIO_MB}MB.")
+            elif ext not in AUDIO_MIME:
+                st.error("صيغة غير مدعومة.")
+            else:
+                folder = hashlib.sha256((a.get("guide_key") or str(aid)).encode()).hexdigest()[:16]
+                key = f"{int(time.time() * 1000)}"
+                url = _put(f"btec/{folder}/audio_{key}.{ext}", data, AUDIO_MIME[ext], up.name)
+                if not url:
+                    st.error("تعذّر رفع الملف إلى التخزين.")
+                else:
+                    media.append({"id_key": key, "kind": "audio", "url": url, "title": title.strip() or up.name,
+                                  "student_visible": vis})
+                    store.update("btec_assignments", {"id": aid}, {"media": media})
+                    st.rerun()
+
+
 # ================================================================ عرض الدليل
 def show_guide(a, staff=False):
     d = a.get("data") or {}
@@ -297,6 +375,7 @@ def show_guide(a, staff=False):
     notes = (a.get("teacher_notes") or "").strip()
     if notes:
         st.warning("**📌 ملاحظات مهمة**\n\n" + notes.replace("\n", "  \n"))
+    _show_media(a, staff=staff)
     st.divider()
     by_n = {i["n"]: i for i in (a.get("images") or [])}
     for chunk in re.split(r"(\[\[IMG:\d+\]\])", a.get("student_guide") or ""):
@@ -401,11 +480,11 @@ def _student_eval(user, a):
     if not crit:
         st.info("لم تُستخرج معايير لهذا الواجب، لذا لا يمكن تقييمه هنا.")
         return
-    st.caption("ارفع واجبك (صور/PDF/Word) وسيقارنه المساعد بمعايير هذا الواجب ويخبرك بما أنجزته وما ينقصك قبل التسليم. "
+    st.caption("ارفع واجبك (صور/Word) وسيقارنه المساعد بمعايير هذا الواجب ويخبرك بما أنجزته وما ينقصك قبل التسليم. "
                "لا تُحفظ ملفاتك ولا التقرير في النظام؛ نزّل التقرير إن أردت الاحتفاظ به. التقييم استرشادي وليس درجة رسمية، "
                "والتقييم النهائي لمعلمك. يُحتسب طلب واحد من حصتك اليومية.")
     aid = a["id"]
-    ups = st.file_uploader("ملفات واجبك", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"],
+    ups = st.file_uploader("ملفات واجبك", type=["png", "jpg", "jpeg", "webp", "docx"],
                            accept_multiple_files=True, key=f"btec_se_up_{aid}")
     rkey = f"btec_se_report_{aid}"
     if st.button("✅ قيّم واجبي", type="primary", key=f"btec_se_run_{aid}"):
@@ -532,7 +611,7 @@ def render_staff(user, tracks):
 
 
 def _tab_upload(user, grade, track_id, subj="all"):
-    st.caption("ارفع صور الواجب أو ملفه (PDF/Word). سيُستخرج الواجب ومعاييره ويُولَّد دليل الطالب بنصه وصوره، ثم يُخزَّن ليختاره الطلاب. "
+    st.caption("ارفع صور الواجب أو ملفه (صور/Word). سيُستخرج الواجب ومعاييره ويُولَّد دليل الطالب بنصه وصوره، ثم يُخزَّن ليختاره الطلاب. "
                "يُحتسب طلب واحد من حصتك اليومية.")
     subs = store.subjects_for(track_id)
     subject_id = None
@@ -543,7 +622,7 @@ def _tab_upload(user, grade, track_id, subj="all"):
                                   format_func=lambda i: next(s["name"] for s in subs if s["id"] == i))
     else:
         st.info("لم تُعرَّف مباحث لهذا الصف/التخصص؛ سيُحفظ الواجب بلا مبحث. يضيف المدير المباحث من «📘 مباحث BTEC».")
-    ups = st.file_uploader("ملفات الواجب", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"],
+    ups = st.file_uploader("ملفات الواجب", type=["png", "jpg", "jpeg", "webp", "docx"],
                            accept_multiple_files=True, key="btec_up")
     notes = st.text_area("📌 ملاحظات مهمة (اختياري)", key=f"btec_up_notes_{track_id}", height=110,
                          placeholder="مثال: التسليم عبر المنصة فقط، يلزم إرفاق صور من العمل الميداني، موعد العرض يوم الأحد...",
@@ -707,6 +786,8 @@ def _tab_teacher_explain(user, grade, track_id, subj="all"):
     a = _pick_assignment(grade, track_id, "btec_exp_pick", subj=subj)
     if not a:
         return
+    _media_manager(a)
+    st.divider()
     if not a.get("teacher_explain"):
         st.info("لم يُولَّد دليل شرح لهذا الواجب بعد. يُولَّد مرة واحدة ثم يُخزَّن لكل المعلمين.")
         if st.button("✨ إنشاء دليل شرح الواجب", key=f"btec_gen_exp_{a['id']}"):
@@ -854,10 +935,10 @@ def _show_report(rep):
 
 
 def _tab_evidence(user, grade, track_id, subj="all"):
-    st.caption("ارفع ملف الواجب الذي سلّمه الطالب (صور/PDF/Word). سيتعرّف النظام على الواجب ويفحص الأدلة مقابل معاييره ويُعدّ تقريرًا. "
+    st.caption("ارفع ملف الواجب الذي سلّمه الطالب (صور/Word). سيتعرّف النظام على الواجب ويفحص الأدلة مقابل معاييره ويُعدّ تقريرًا. "
                "لا يلزم أن يكون الطالب مسجَّلًا، ولا يُحفظ شيء في النظام: نزّل التقرير إن أردت الاحتفاظ به. "
                "يُحتسب طلب واحد من حصتك اليومية.")
-    ups = st.file_uploader("ملف الواجب المسلَّم", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"],
+    ups = st.file_uploader("ملف الواجب المسلَّم", type=["png", "jpg", "jpeg", "webp", "docx"],
                            accept_multiple_files=True, key="btec_ev_up")
     label = st.text_input("اسم الطالب (اختياري — يظهر في التقرير)", key="btec_ev_label")
     manual = None
