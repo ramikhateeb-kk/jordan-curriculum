@@ -12,7 +12,7 @@ from config import BASE
 
 LOCAL = BASE / "data" / "btec_local.json"
 TIMEOUT = 25
-PK = {"btec_staff": ("user_id", "track_id"), "btec_progress": ("assignment_id", "student_id", "criterion")}
+PK = {"btec_staff": ("user_id", "track_id")}
 
 
 def _sb():
