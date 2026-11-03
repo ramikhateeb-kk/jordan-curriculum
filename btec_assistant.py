@@ -385,7 +385,71 @@ def render_student(user, tracks):
         return
     pick = st.selectbox("اختر الواجب", [r["id"] for r in rows], format_func=lambda i: next(r["title"] for r in rows if r["id"] == i))
     a = store.assignment(pick)
-    show_guide(a)
+    t_guide, t_eval = st.tabs(["📘 دليل الواجب", "✅ تقييم الواجب"])
+    with t_guide:
+        show_guide(a)
+    with t_eval:
+        _student_eval(user, a)
+
+
+STUDENT_VERDICT = {"met": "✅ منجز", "partial": "🟡 جزئي", "not_met": "❌ غير منجز", "not_assessable": "⚪ غير واضح"}
+
+
+def _student_eval(user, a):
+    """الطالب يرفع واجبه فيُقارَن بمعايير هذا الواجب ويُعطى تقريرًا بما أُنجز وما ينقص. لا يُحفظ شيء."""
+    crit = _criteria(a)
+    if not crit:
+        st.info("لم تُستخرج معايير لهذا الواجب، لذا لا يمكن تقييمه هنا.")
+        return
+    st.caption("ارفع واجبك (صور/PDF/Word) وسيقارنه المساعد بمعايير هذا الواجب ويخبرك بما أنجزته وما ينقصك قبل التسليم. "
+               "لا تُحفظ ملفاتك ولا التقرير في النظام؛ نزّل التقرير إن أردت الاحتفاظ به. التقييم استرشادي وليس درجة رسمية، "
+               "والتقييم النهائي لمعلمك. يُحتسب طلب واحد من حصتك اليومية.")
+    aid = a["id"]
+    ups = st.file_uploader("ملفات واجبك", type=["png", "jpg", "jpeg", "webp", "pdf", "docx"],
+                           accept_multiple_files=True, key=f"btec_se_up_{aid}")
+    rkey = f"btec_se_report_{aid}"
+    if st.button("✅ قيّم واجبي", type="primary", key=f"btec_se_run_{aid}"):
+        items, err = read_uploads(ups)
+        if err:
+            st.error(err)
+        else:
+            auth_ui.require_quota_or_stop(user)
+            with st.spinner("جارٍ مقارنة واجبك بالمعايير..."):
+                try:
+                    res = btec_ai.evaluate_for_student(a["data"], items, a.get("teacher_notes"))
+                except Exception as e:  # noqa: BLE001
+                    res = None
+                    st.error(f"حدث خطأ: {e}")
+            if res and res.get("criteria"):
+                st.session_state[rkey] = {"assignment_label": a["title"], "student_label": user.get("name", ""), "result": res,
+                                          "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
+            elif res is not None:
+                st.error("تعذّر فهم نتيجة التقييم. حاول مرة أخرى.")
+    rep = st.session_state.get(rkey)
+    if not rep:
+        return
+    res = rep["result"]
+    st.divider()
+    codes = {c["code"] for c in crit}
+    rows = [c for c in res["criteria"] if c.get("code") in codes]
+    met = sum(1 for c in rows if c.get("verdict") == "met")
+    st.markdown("#### 📄 تقرير تقييم واجبك")
+    st.metric("المعايير المنجزة", f"{met} من {len(crit)}")
+    if res.get("summary"):
+        st.info(res["summary"])
+    st.dataframe(pd.DataFrame([{"المعيار": c.get("code"), "الحالة": STUDENT_VERDICT.get(c.get("verdict"), "—"),
+                                "شو لقيت بشغلك": c.get("evidence_found", ""), "شو ناقص": c.get("missing", ""),
+                                "نصيحة": c.get("feedback", "")} for c in rows]), hide_index=True, use_container_width=True)
+    if res.get("next_steps"):
+        st.markdown("**الخطوات اللي بعدها:**")
+        for i, s_ in enumerate(res["next_steps"], 1):
+            st.markdown(f"{i}. {s_}")
+    try:
+        st.download_button("⬇️ تنزيل التقرير (Word)", _report_docx(rep), file_name="btec_assignment_review.docx",
+                           mime=DOCX_MIME, key=f"btec_se_dl_{aid}")
+    except Exception as e:  # noqa: BLE001
+        st.caption(f"تعذّر إنشاء ملف Word: {e}")
+
 
 # ================================================================ طاقم BTEC (واجهة المدير)
 def render_staff_admin(tracks):
@@ -696,6 +760,10 @@ def _report_docx(rep):
         for cell in row.cells:
             for p in cell.paragraphs:
                 _rtl(p)
+    if res.get("next_steps"):
+        _rtl(doc.add_heading("الخطوات التالية", level=2))
+        for c in res["next_steps"]:
+            _rtl(doc.add_paragraph(str(c), style="List Number"))
     if res.get("concerns"):
         _rtl(doc.add_heading("ملاحظات تستدعي انتباه المعلم", level=2))
         for c in res["concerns"]:
